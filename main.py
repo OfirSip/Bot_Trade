@@ -6,10 +6,11 @@ from telebot import types
 from telebot.apihelper import delete_webhook, ApiTelegramException
 
 from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL, SUPPORTED_EXPIRIES
-from data_fetcher import STATE, start_fetcher_in_thread
+from data_fetcher import STATE, start_fetcher_in_thread, HAS_LIVE_KEY
 from strategy import decide_from_ticks, CFG as STRAT_CFG
-from visuals import make_price_figure_png
+from visuals import make_overlay_figure_png
 
+# ------------------------ ENV ------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_LOCK = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SINGLETON_PORT = int(os.getenv("SINGLETON_PORT", "47653"))
@@ -18,13 +19,13 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
-# ------------------------ anti-409 & single-instance ------------------------
+# ------------------------ Anti-409 & single-instance ------------------------
 def aggressive_reset():
     try: bot.remove_webhook()
     except Exception: pass
     try: delete_webhook(BOT_TOKEN, drop_pending_updates=True)
     except Exception: pass
-    time.sleep(0.8)
+    time.sleep(0.7)
 
 _LOCK = None
 def ensure_single_instance(port: int = SINGLETON_PORT):
@@ -35,22 +36,21 @@ def ensure_single_instance(port: int = SINGLETON_PORT):
         _LOCK.bind(("127.0.0.1", port))
         _LOCK.listen(1)
     except OSError:
-        print("Another instance running. Exiting.")
+        print("Another instance is running. Exiting.")
         sys.exit(0)
 
-# ------------------------ Bot State ------------------------
+# ------------------------ App state ------------------------
 class BotState:
     def __init__(self):
         self.po_asset: str = "EUR/USD"
         self.finnhub_symbol: str = PO_TO_FINNHUB.get(self.po_asset, DEFAULT_SYMBOL)
 
 APP = BotState()
+_fetcher_started = False
 
 def current_symbol():
     return APP.finnhub_symbol
 
-# start fetcher thread once
-_fetcher_started = False
 def ensure_fetcher():
     global _fetcher_started
     if not _fetcher_started:
@@ -60,28 +60,21 @@ def ensure_fetcher():
 def allowed(msg) -> bool:
     return (not CHAT_LOCK) or (str(msg.chat.id) == CHAT_LOCK)
 
-# ------------------------ UI helpers ------------------------
+# ------------------------ UI builders ------------------------
 def main_menu_markup():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(
-        types.KeyboardButton("📊 נכס"),
-        types.KeyboardButton("⚙️ הגדרות"),
-    )
-    kb.add(
-        types.KeyboardButton("🛰️ סטטוס"),
-        types.KeyboardButton("🖼️ ויזואל"),
-    )
+    kb.add(types.KeyboardButton("📊 נכס"), types.KeyboardButton("⚙️ הגדרות"))
+    kb.add(types.KeyboardButton("🛰️ סטטוס"), types.KeyboardButton("🖼️ ויזואל"))
     kb.add(types.KeyboardButton("🧠 סיגנל"))
     return kb
 
 def asset_inline_keyboard(page: int = 0, page_size: int = 6):
     keys = list(PO_TO_FINNHUB.keys())
     start = page * page_size
-    chunk = keys[start:start+page_size]
+    chunk = keys[start:start + page_size]
     markup = types.InlineKeyboardMarkup()
     for k in chunk:
         markup.add(types.InlineKeyboardButton(f"🎯 {k}", callback_data=f"asset::{k}::{page}"))
-    # pagination
     nav = []
     if start > 0:
         nav.append(types.InlineKeyboardButton("⬅️", callback_data=f"asset_nav::{page-1}"))
@@ -93,23 +86,22 @@ def asset_inline_keyboard(page: int = 0, page_size: int = 6):
 
 def settings_inline_keyboard():
     markup = types.InlineKeyboardMarkup()
-    # expiry
-    exp_row = [types.InlineKeyboardButton(f"{'✅ ' if STRAT_CFG['EXPIRY']==e else ''}{e}", callback_data=f"set_expiry::{e}") for e in SUPPORTED_EXPIRIES]
+    exp_row = [types.InlineKeyboardButton(
+        f"{'✅ ' if STRAT_CFG['EXPIRY']==e else ''}{e}",
+        callback_data=f"set_expiry::{e}"
+    ) for e in SUPPORTED_EXPIRIES]
     markup.row(*exp_row)
-    # window
     markup.add(types.InlineKeyboardButton(f"חלון ⏱ {int(STRAT_CFG['WINDOW_SEC'])}s", callback_data="noop"))
     markup.row(
         types.InlineKeyboardButton("-2s", callback_data="win::dec"),
         types.InlineKeyboardButton("+2s", callback_data="win::inc"),
     )
-    # conf min
     markup.add(types.InlineKeyboardButton(f"MinConf 🎯 {STRAT_CFG['CONF_MIN']}%", callback_data="noop"))
     markup.row(
         types.InlineKeyboardButton("-2", callback_data="conf::dec"),
         types.InlineKeyboardButton("+2", callback_data="conf::inc"),
     )
-    # reset
-    markup.add(types.InlineKeyboardButton("🔄 ברירת מחדל", callback_data="reset_cfg"))
+    markup.add(types.InlineKeyboardButton("ברירת מחדל 🔄", callback_data="reset_cfg"))
     return markup
 
 # ------------------------ Handlers ------------------------
@@ -118,11 +110,11 @@ def on_start(msg):
     if not allowed(msg): return
     ensure_fetcher()
     aggressive_reset()
-    bot.send_message(msg.chat.id,
-        "ברוך הבא ל-**PO SignalBot** 🚀\n"
-        "בחר נכס, קבע הגדרות, וצא לדרך.\n\n"
-        "טיפ: חפש התאמה בין הוויזואל לשוק בפועל ב-Pocket Option לפני כניסה.",
-        reply_markup=main_menu_markup())
+    bot.send_message(
+        msg.chat.id,
+        "ברוך הבא ל-**PO SignalBot** 🚀\nבחר נכס, כוון הגדרות, וקבל סיגנל+ויזואל מותאם ל-PO.",
+        reply_markup=main_menu_markup()
+    )
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "📊 נכס")
 def on_asset(msg):
@@ -173,7 +165,7 @@ def on_cfg_adjust(c):
     if k == "conf::dec": STRAT_CFG["CONF_MIN"] = max(50, STRAT_CFG["CONF_MIN"] - 2)
     if k == "conf::inc": STRAT_CFG["CONF_MIN"] = min(90, STRAT_CFG["CONF_MIN"] + 2)
     if k == "reset_cfg":
-        STRAT_CFG.update({"WINDOW_SEC":22.0,"CONF_MIN":55,"EXPIRY":"M1"})
+        STRAT_CFG.update({"WINDOW_SEC":26.0,"CONF_MIN":60,"EXPIRY":"M1"})
     bot.answer_callback_query(c.id)
     on_settings(c.message)
 
@@ -182,24 +174,31 @@ def on_status(msg):
     now = time.time()
     ticks = list(STATE["ticks"])
     n_total = len(ticks)
-    n_win = len([1 for (ts,_) in ticks if now - ts <= STRAT_CFG["WINDOW_SEC"]])
+    n_win = len([1 for (ts, _) in ticks if now - ts <= STRAT_CFG["WINDOW_SEC"]])
     age_ms = int((now - STATE["last_recv_ts"]) * 1000) if STATE["last_recv_ts"] else None
+
     side, conf, dbg = decide_from_ticks(STATE["ticks"])
+
+    source = "LIVE (Finnhub)" if HAS_LIVE_KEY else "MISSING_API_KEY"
+    online = '✅ Online' if STATE['ws_online'] else '⚠️ Offline'
+
     text = (
-        f"📡 **סטטוס דאטה**: {'✅ Online' if STATE['ws_online'] else '⚠️ Offline'} | Reconnects: {STATE['reconnects']}\n"
+        f"📡 **סטטוס דאטה**: {online} | Source: {source} | Reconnects: {STATE['reconnects']}\n"
         f"🔗 Symbol: {APP.finnhub_symbol} (PO: {APP.po_asset})\n"
-        f"📥 Msg recv: {STATE['msg_count']} | Last tick age: {age_ms} ms\n"
+        f"📥 Msg recv: {STATE['msg_count']} | Last tick age: {age_ms if age_ms else 'n/a'} ms\n"
         f"🪟 Window({int(STRAT_CFG['WINDOW_SEC'])}s): {n_win}/{n_total} ticks\n\n"
         f"🧮 **ניתוח** (expiry {STRAT_CFG['EXPIRY']}):\n"
-        f"- Decision: {side} {'🔼' if side=='UP' else '🔽' if side=='DOWN' else '⏳'}\n"
+        f"- Signal: {side} {'🔼' if side=='UP' else '🔽' if side=='DOWN' else '⏳'}\n"
         f"- Confidence: {conf}%\n"
+        f"- RSI: {dbg.get('rsi','n/a')} | Vol: {dbg.get('vol','n/a')} | Regime: {dbg.get('regime','n/a')}\n"
+        f"- EMA spread: {dbg.get('ema_spread','n/a'):.4g} | Trend slope: {dbg.get('trend_slope','n/a'):.4g}\n"
     )
     bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=main_menu_markup())
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🖼️ ויזואל")
 def on_visual(msg):
-    png = make_price_figure_png(list(STATE["ticks"]), window_sec=STRAT_CFG["WINDOW_SEC"])
-    bot.send_photo(msg.chat.id, png, caption="📷 חלון מחירים נוכחי (בדוק התאמה ב-PO)", reply_markup=main_menu_markup())
+    png = make_overlay_figure_png(list(STATE["ticks"]), window_sec=STRAT_CFG["WINDOW_SEC"])
+    bot.send_photo(msg.chat.id, png, caption="📷 חלון מחירים + EMA overlay (השווה מול PO)", reply_markup=main_menu_markup())
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🧠 סיגנל")
 def on_signal(msg):
@@ -207,14 +206,14 @@ def on_signal(msg):
     arrow = "🔼" if side == "UP" else "🔽" if side == "DOWN" else "⏳"
     cap = (
         f"🧠 **סיגנל**\n"
-        f"נכס: {APP.po_asset} → {APP.finnhub_symbol}\n"
+        f"נכס: {APP.po_asset} → `{APP.finnhub_symbol}`\n"
         f"Expiry: {STRAT_CFG['EXPIRY']}\n"
         f"Decision: {side} {arrow}\n"
-        f"Confidence: {conf}%\n"
-        f"RSI: {dbg.get('rsi'):.1f} | Vol: {dbg.get('vol'):.2e}\n"
-        f"עצה: וודא ב-PO שהגרף מראה אותו כיוון/תנודתיות לפני כניסה ✅"
+        f"Confidence: {conf}%  ({dbg.get('regime','?')}, RSI={dbg.get('rsi','?'):.1f})\n"
+        f"EMA_spread={dbg.get('ema_spread','?'):.3g} | slope={dbg.get('trend_slope','?'):.3g} | vol={dbg.get('vol','?'):.2e}\n"
+        f"⚠️ אמת התאמה מול הגרף ב-PO לפני כניסה."
     )
-    png = make_price_figure_png(list(STATE["ticks"]), window_sec=STRAT_CFG["WINDOW_SEC"])
+    png = make_overlay_figure_png(list(STATE["ticks"]), window_sec=STRAT_CFG["WINDOW_SEC"])
     bot.send_photo(msg.chat.id, png, caption=cap, parse_mode="Markdown", reply_markup=main_menu_markup())
 
 @bot.message_handler(commands=["panic"])
@@ -224,9 +223,10 @@ def on_panic(msg):
     except Exception: pass
     try: delete_webhook(BOT_TOKEN, drop_pending_updates=True)
     except Exception: pass
-    bot.send_message(msg.chat.id, "🧯 PANIC: webhook נוקה. מבצע יציאה.")
+    bot.send_message(msg.chat.id, "🧯 PANIC: webhook נוקה. יוצא.")
     sys.exit(0)
 
+# ------------------------ Runner ------------------------
 def run_forever():
     while True:
         try:
