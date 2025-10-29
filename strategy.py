@@ -3,26 +3,24 @@ from __future__ import annotations
 import math, time
 from typing import Tuple, Dict, List
 
-# לא תלוי בשאר מודולים פרט לסטנדרט; API נשאר זהה: decide_from_ticks(deque)->(side,conf,dbg)
-
 CFG = {
     "WINDOW_SEC": 26.0,      # מתעדכן מהבוט
     "ALPHA_FAST": 0.40,
     "ALPHA_SLOW": 0.14,
     "RSI_PERIOD": 14,
-    "RSI_BULL": 55.0,        # bias LONG
-    "RSI_BEAR": 45.0,        # bias SHORT
-    "CONF_MIN": 55,          # סף מינימלי להחזרת טרייד
+    "RSI_BULL": 55.0,
+    "RSI_BEAR": 45.0,
+    "CONF_MIN": 55,
     "CONF_MAX": 96,
-    "VOL_GUARD": 8e-5,       # שוק ישנוני מוריד אמון
-    "HYSTERESIS": 0.08,      # רצועה נגד ויפסו
-    "COOLDOWN_SEC": 12.0,    # לא להפוך מהר
-    "NEUTRAL_RSI_LOW": 48.0, # ענישה כש-RSI באזור ניטרלי
+    "VOL_GUARD": 8e-5,
+    "HYSTERESIS": 0.08,
+    "COOLDOWN_SEC": 12.0,
+    "NEUTRAL_RSI_LOW": 48.0,
     "NEUTRAL_RSI_HIGH": 52.0,
     "EXPIRY": "M1",
 }
 
-# --- עזרי חישוב קלים ---
+# ===== עזרי חישוב =====
 def _log_changes(prices: List[float]) -> List[float]:
     base = prices[0]
     return [math.log(max(1e-12, p / base)) for p in prices]
@@ -38,12 +36,13 @@ def _ema_alpha(series: List[float], alpha: float) -> float:
         v = alpha * x + (1.0 - alpha) * v
     return float(v)
 
-def _stdev_safe(series: List[float]) -> float:
-    if len(series) < 2:
+def _robust_vol(diffs_: List[float]) -> float:
+    if not diffs_:
         return 1e-9
-    m = sum(series)/len(series)
-    var = sum((v-m)**2 for v in series)/len(series)
-    return max(1e-9, var**0.5)
+    s = sorted(diffs_)
+    med = s[len(s)//2]
+    mad = sorted(abs(v - med) for v in diffs_)[len(diffs_)//2]
+    return max(1e-9, 1.4826 * mad)
 
 def _rsi(prices: List[float], period: int = 14) -> float:
     if len(prices) < period + 1:
@@ -58,7 +57,28 @@ def _rsi(prices: List[float], period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-# --- מצב פנימי לריסון Confidence ולעקביות כיוון ---
+def _direction_from_score(score: float, last_prices: List[float]) -> str:
+    if score > 0:  return "UP"
+    if score < 0:  return "DOWN"
+    if len(last_prices) >= 2 and last_prices[-1] >= last_prices[-2]:
+        return "UP"
+    return "DOWN"
+
+def _persistence_ratio(step_series: List[float]) -> float:
+    if not step_series:
+        return 0.5
+    pos = sum(1 for d in step_series if d >= 0)
+    return pos / len(step_series)
+
+def _breakout_flags(prices: list[float]) -> tuple[bool, bool]:
+    if len(prices) < 6:
+        return (False, False)
+    hi = max(prices[:-1])
+    lo = min(prices[:-1])
+    last = prices[-1]
+    return (last > hi, last < lo)
+
+# ===== מצב פנימי =====
 _LAST_SIGNAL_TS = 0.0
 _LAST_SIDE = "WAIT"
 _LAST_NORM = 0.0
@@ -72,87 +92,88 @@ def _apply_hysteresis(side: str, norm_score: float) -> Tuple[str, float]:
     _LAST_SIDE, _LAST_NORM = side, norm_score
     return side, norm_score
 
-def _direction_from_score(score: float, last_prices: List[float]) -> str:
-    if score > 0:  return "UP"
-    if score < 0:  return "DOWN"
-    if len(last_prices) >= 2 and last_prices[-1] >= last_prices[-2]:
-        return "UP"
-    return "DOWN"
-
-def _robust_vol(diffs_: List[float]) -> float:
-    # MAD בקירוב ל-σ: נגד קפיצות אקראיות
-    if not diffs_:
-        return 1e-9
-    med = sorted(diffs_)[len(diffs_)//2]
-    mad = sorted(abs(v - med) for v in diffs_)[len(diffs_)//2]
-    return max(1e-9, 1.4826 * mad)
-
 def compute_signal_from_prices(prices: List[float]) -> Tuple[str, int, Dict]:
     global _LAST_SIGNAL_TS, _CONF_EWMA
     now_ts = time.time()
 
-    if not prices or len(prices) < 8:
+    if not prices or len(prices) < 10:
         return "WAIT", 50, {"reason": "insufficient_data"}
 
-    ch = _log_changes(prices)
-    df = _diffs(ch)
-    vol_r = _robust_vol(df)
-    ema_fast = _ema_alpha(ch, CFG["ALPHA_FAST"])
-    ema_slow = _ema_alpha(ch, CFG["ALPHA_SLOW"])
-    ema_spread = ema_fast - ema_slow       # הפרדה בין מהיר/איטי
-    trend_slope = ch[-1] - ch[0]           # נטייה מצטברת
+    ch  = _log_changes(prices)
+    df  = _diffs(ch)
+    vol = _robust_vol(df)
+    ema_fast  = _ema_alpha(ch, CFG["ALPHA_FAST"])
+    ema_slow  = _ema_alpha(ch, CFG["ALPHA_SLOW"])
+    ema_spread = ema_fast - ema_slow
+    trend_slope = ch[-1] - ch[0]
     rsi_v = _rsi(prices, CFG["RSI_PERIOD"])
 
-    # נורמליזציה עיקרית: raw / vol_r
-    raw = 0.6*ema_spread + 0.4*trend_slope
-    norm = abs(raw) / max(1e-9, vol_r)
+    raw  = 0.58 * ema_spread + 0.42 * trend_slope
+    norm = abs(raw) / max(1e-9, vol)
 
-    # ענישה למצב RSI ניטרלי (פחות edge)
-    if CFG["NEUTRAL_RSI_LOW"] <= rsi_v <= CFG["NEUTRAL_RSI_HIGH"]:
-        norm *= 0.75
-
-    # guard לשוק ישנוני
-    slow_market_penalty = 0.0
-    if vol_r < CFG["VOL_GUARD"]:
-        slow_market_penalty = 0.12
-
-    # bias עדין לפי RSI (לא הופך צד)
-    bias = 0.0
-    if rsi_v >= CFG["RSI_BULL"]:
-        bias += 0.05
-    elif rsi_v <= CFG["RSI_BEAR"]:
-        bias -= 0.05
-
-    # הפקת כיוון
     side_pre = _direction_from_score(raw, prices)
-    # היסטרזיס נגד היפוכים מהירים
     side, norm_adj = _apply_hysteresis(side_pre, norm)
 
-    # Cooldown נגד “מרדף”
-    if _LAST_SIGNAL_TS and (now_ts - _LAST_SIGNAL_TS) < CFG["COOLDOWN_SEC"]:
-        if side != _LAST_SIDE and side in ("UP", "DOWN"):
-            return "WAIT", 52, {"reason": "cooldown", "since_last": now_ts - _LAST_SIGNAL_TS}
+    # עונשים “רכים”
+    if CFG["NEUTRAL_RSI_LOW"] <= rsi_v <= CFG["NEUTRAL_RSI_HIGH"]:
+        norm_adj *= 0.75
+    if vol < CFG["VOL_GUARD"]:
+        norm_adj *= 0.85
 
-    # Confidence אדפטיבי ומרוסן:
-    # בסיס: 50 + 30*tanh(norm_adj) → טווח טיפוסי 55..~80 (בלי להיתקע על 86)
-    conf_base = 50 + 30*math.tanh(norm_adj + bias)
-    conf_base -= slow_market_penalty*100.0  # ענישה לשוק איטי
-    # EWMA כדי למנוע קפיצות וריצוד; מקרב בין רגעי לגלובלי
-    _CONF_EWMA = 0.65*_CONF_EWMA + 0.35*conf_base
+    # ===== מגבר יישור (alignment) =====
+    long_win_n   = max(20, int(round(len(prices) * 2.5)))
+    long_prices  = prices[-long_win_n:] if len(prices) >= long_win_n else prices
+    chL  = _log_changes(long_prices)
+    dfL  = _diffs(chL)
+    ema_spread_L = _ema_alpha(chL, CFG["ALPHA_FAST"]) - _ema_alpha(chL, CFG["ALPHA_SLOW"])
+    slope_L      = chL[-1] - chL[0]
+    side_long    = _direction_from_score(0.58*ema_spread_L + 0.42*slope_L, long_prices)
+
+    bo_up, bo_dn = _breakout_flags(prices)
+    breakout_ok  = (bo_up and side == "UP") or (bo_dn and side == "DOWN")
+
+    persist_price = _persistence_ratio(_diffs(prices))  # על מחיר ישיר לרגישות צד
+    tick_imbalance = abs(2*persist_price - 1.0)         # 0..1, 0.36 ≈ 68%
+
+    rsi_support = (side == "UP" and rsi_v >= max(58.0, CFG["RSI_BULL"])) or \
+                  (side == "DOWN" and rsi_v <= min(42.0, CFG["RSI_BEAR"]))
+
+    alignment_bonus = 0.0
+    if side == side_long and rsi_support:
+        alignment_bonus += 0.12
+    if breakout_ok:
+        alignment_bonus += 0.10
+    if tick_imbalance >= 0.36:
+        alignment_bonus += 0.06
+
+    # בסיס בטחון
+    conf_base = 50 + 30 * math.tanh(norm_adj)
+    conf_base += alignment_bonus * 100.0  # עד ~+12 נק'
+
+    # ריכוך EWMA
+    _CONF_EWMA = 0.6*_CONF_EWMA + 0.4*conf_base
     conf = int(max(CFG["CONF_MIN"], min(CFG["CONF_MAX"], _CONF_EWMA)))
 
-    # אם האות חלש (גם אחרי הכל) → WAIT
+    # Cooldown: מניעת היפוך מיידי
+    if _LAST_SIGNAL_TS and (now_ts - _LAST_SIGNAL_TS) < CFG["COOLDOWN_SEC"]:
+        if side != _LAST_SIDE and side in ("UP","DOWN"):
+            return "WAIT", max(52, CFG["CONF_MIN"]-3), {"reason":"cooldown"}
+
     if conf < CFG["CONF_MIN"]:
         return "WAIT", conf, {
-            "vol": vol_r, "rsi": rsi_v, "ema_spread": ema_spread,
-            "trend_slope": trend_slope, "norm": norm_adj
+            "vol": vol, "rsi": rsi_v, "ema_spread": ema_spread,
+            "trend_slope": trend_slope, "norm": norm_adj,
+            "persist": persist_price, "tick_imb": tick_imbalance,
+            "align_bonus": alignment_bonus
         }
 
     _LAST_SIGNAL_TS = now_ts
     dbg = {
-        "n": len(prices), "price_now": prices[-1],
-        "vol": vol_r, "rsi": rsi_v, "ema_spread": ema_spread,
-        "trend_slope": trend_slope, "norm": norm_adj, "expiry": CFG["EXPIRY"]
+        "n": len(prices),
+        "price_now": prices[-1],
+        "vol": vol, "rsi": rsi_v, "ema_spread": ema_spread, "trend_slope": trend_slope,
+        "norm": norm_adj, "persist": persist_price, "tick_imb": tick_imbalance,
+        "align_bonus": alignment_bonus, "expiry": CFG["EXPIRY"]
     }
     return side, conf, dbg
 
