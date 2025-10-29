@@ -2,3 +2,5 @@ pyTelegramBotAPI>=4.20
 websockets>=12.0
 matplotlib>=3.8
 selenium
+telebot
+webdriver-manager
