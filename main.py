@@ -1,6 +1,6 @@
 # main.py
 from __future__ import annotations
-import os, sys, time, socket, io, collections
+import os, sys, time, socket, io, collections, threading
 import telebot
 from telebot import types
 from telebot.apihelper import delete_webhook, ApiTelegramException
@@ -8,6 +8,7 @@ from telebot.apihelper import delete_webhook, ApiTelegramException
 from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL
 from data_fetcher import STATE, start_fetcher_in_thread, HAS_LIVE_KEY
 from strategy import decide_from_ticks, CFG as STRAT_CFG
+from auto_trader import AutoTrader
 
 # ===== גרף =====
 import matplotlib
@@ -27,7 +28,7 @@ class BotState:
         self.po_asset: str = "EUR/USD"
         self.finnhub_symbol: str = PO_TO_FINNHUB.get(self.po_asset, DEFAULT_SYMBOL)
         self.chart_mode: str = "CANDLE"   # "CANDLE" / "LINE"
-        self.candle_tf_sec: int = 60      # רלוונטי רק ב-CANDLE
+        self.candle_tf_sec: int = 60      # ב-LINE מוצג כ-N/A
         self.trade_expiry_sec: int = 60
         self.window_sec: int = 26
         # ביצועים יומיים
@@ -36,15 +37,16 @@ class BotState:
         self.last_signal = None
 
 APP = BotState()
+AUTO = AutoTrader()
 _fetcher_started = False
 
-# ===== ENV =====
+# ===== ENV בסיסיים לטלגרם =====
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_LOCK = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SINGLETON_PORT = int(os.getenv("SINGLETON_PORT", "47653"))
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)  # parse_mode=None כדי למנוע שגיאות Markdown
 
 # ===== Anti-409 & single-instance =====
 def aggressive_reset():
@@ -117,16 +119,11 @@ def _nearest_choice(val: int, choices: list[int]) -> int:
     return min(choices, key=lambda c: abs(c - val))
 
 def _sync_from_tf_trade():
-    """
-    עדכון Window (וגם EXPIRY לתצוגה) מתוך TF/Expiry בהתאם למצב תרשים.
-    CANDLE: Window ≈ max(3×TF, 0.8×Expiry)
-    LINE:   Window ≈ 0.9×Expiry   (אין TF)
-    """
     tx = APP.trade_expiry_sec
     if APP.chart_mode == "CANDLE":
         tf = APP.candle_tf_sec
         wnd = max(3*tf, int(0.8*tx))
-    else:  # LINE
+    else:  # LINE (אין TF)
         wnd = int(0.9*tx)
     wnd = max(16, min(wnd, 90))
     APP.window_sec = wnd
@@ -134,11 +131,6 @@ def _sync_from_tf_trade():
     STRAT_CFG["EXPIRY"] = f"{tx}s" if tx < 60 else f"{int(tx/60)}m"
 
 def _sync_from_window():
-    """
-    עדכון TF/Expiry מתוך Window בהתאם למצב תרשים.
-    CANDLE: TF ≈ Window/3 ; Expiry ≈ 1.25×Window
-    LINE:   TF לא רלוונטי; Expiry ≈ 1.1×Window
-    """
     w = APP.window_sec
     if APP.chart_mode == "CANDLE":
         target_tf = max(10, int(round(w/3)))
@@ -146,7 +138,6 @@ def _sync_from_window():
         APP.candle_tf_sec = _nearest_choice(target_tf, tf_allowed)
         target_tx = int(round(w*1.25))
     else:
-        # אין TF; שומרים את הישן אך מתייחסים אליו כ-N/A בתצוגה
         target_tx = int(round(w*1.10))
     tx_allowed = [sec for _, sec in TRADE_CHOICES]
     APP.trade_expiry_sec = _nearest_choice(target_tx, tx_allowed)
@@ -154,15 +145,9 @@ def _sync_from_window():
     STRAT_CFG["EXPIRY"] = f"{APP.trade_expiry_sec}s" if APP.trade_expiry_sec < 60 else f"{int(APP.trade_expiry_sec/60)}m"
 
 def _recommend_from_expiry(expiry_sec: int) -> tuple[str | None, int]:
-    """
-    החזרת המלצה מהירה מ-Expiry:
-    CANDLE: TF≈Expiry/3 , Window≈max(3×TF, 0.8×Expiry)
-    LINE:   TF=None ,     Window≈0.9×Expiry
-    """
     if APP.chart_mode == "LINE":
         wnd = max(16, min(int(0.9*expiry_sec), 90))
         return None, wnd
-    # CANDLE
     tf_allowed = [sec for _, sec in CANDLE_CHOICES]
     tf_guess = max(10, int(round(expiry_sec/3)))
     tf = _nearest_choice(tf_guess, tf_allowed)
@@ -187,6 +172,7 @@ def main_menu_markup():
     kb.add(types.KeyboardButton("📘 הוראות"), types.KeyboardButton("📈 ביצועים"))
     kb.add(types.KeyboardButton("🛰️ סטטוס"), types.KeyboardButton("🖼️ ויזואל"))
     kb.add(types.KeyboardButton("🧠 סיגנל"))
+    kb.add(types.KeyboardButton("🤖 מסחר אוטומטי"), types.KeyboardButton("⚙️ Auto-Settings"))
     return kb
 
 def asset_inline_keyboard(page: int = 0, page_size: int = 6):
@@ -330,7 +316,6 @@ def on_chartmode(msg):
 def on_chartmode_pick(c):
     mode = c.data.split("::")[1]
     APP.chart_mode = mode if mode in CHART_MODES else "CANDLE"
-    # בעת מעבר ל-LINE אין TF; בעת מעבר ל-CANDLE נשמור TF קיים או ברירת מחדל
     _sync_from_tf_trade()
     bot.answer_callback_query(c.id, text=f"Chart={APP.chart_mode}")
     _print_all(c.message.chat.id, "מצב התרשים עודכן")
@@ -373,7 +358,6 @@ def on_set_candle(c):
 def on_set_trade(c):
     sec = int(c.data.split("::")[1])
     APP.trade_expiry_sec = sec
-    # המלצה מיידית בהתאם למצב התרשים
     rec_tf, rec_w = _recommend_from_expiry(sec)
     APP.window_sec = rec_w
     if APP.chart_mode == "CANDLE" and rec_tf is not None:
@@ -443,7 +427,10 @@ def on_status(msg):
         f"Persistence: {_fmt(dbg.get('persist'), '.2f')}",
         f"Tick imbalance: {_fmt(dbg.get('tick_imb'), '.2f')}",
         f"Align bonus: {_fmt(dbg.get('align_bonus'), '.2f')}",
+        "",
+        "Auto-Trading",
     ]
+    lines += AUTO.status_lines()
     bot.send_message(msg.chat.id, "\n".join(lines), reply_markup=main_menu_markup())
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🖼️ ויזואל")
@@ -517,6 +504,61 @@ def on_performance(msg):
     ]
     bot.send_message(msg.chat.id, "\n".join(lines), reply_markup=main_menu_markup())
 
+# ===== מסחר אוטומטי: תפעול =====
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "🤖 מסחר אוטומטי")
+def on_auto_toggle(msg):
+    if AUTO.state.enabled:
+        AUTO.disable()
+        bot.send_message(msg.chat.id, "Auto-Trading: OFF", reply_markup=main_menu_markup())
+    else:
+        AUTO.enable()
+        bot.send_message(msg.chat.id, "Auto-Trading: ON", reply_markup=main_menu_markup())
+
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "⚙️ Auto-Settings")
+def on_auto_settings(msg):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("Conf −5", callback_data="auto::conf:-5"),
+        types.InlineKeyboardButton("Conf +5", callback_data="auto::conf:+5"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("Interval −5s", callback_data="auto::ival:-5"),
+        types.InlineKeyboardButton("Interval +5s", callback_data="auto::ival:+5"),
+    )
+    kb.add(types.InlineKeyboardButton("סטטוס אוטו", callback_data="auto::status"))
+    bot.send_message(msg.chat.id, "שנה סף ביטחון/מרווח זמן:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("auto::"))
+def on_auto_cb(c):
+    _, kind, val = c.data.split("::")
+    if kind == "conf":
+        AUTO.set_conf_threshold(AUTO.state.conf_threshold + int(val))
+        bot.answer_callback_query(c.id, text=f"Conf ≥ {AUTO.state.conf_threshold}")
+    elif kind == "ival":
+        AUTO.set_min_interval(AUTO.state.min_interval_sec + int(val))
+        bot.answer_callback_query(c.id, text=f"Interval = {AUTO.state.min_interval_sec}s")
+    elif kind == "status":
+        bot.answer_callback_query(c.id, text="Auto status")
+    bot.edit_message_text(
+        chat_id=c.message.chat.id,
+        message_id=c.message.message_id,
+        text="\n".join(AUTO.status_lines()),
+        reply_markup=None
+    )
+
+# ===== לולאת החלטה רקע למסחר אוטומטי =====
+def auto_loop():
+    while True:
+        try:
+            if AUTO.state.enabled:
+                side, conf, _dbg = decide_from_ticks(STATE["ticks"])
+                if side in ("UP","DOWN") and conf >= AUTO.state.conf_threshold:
+                    AUTO.place_trade(side)
+            time.sleep(2.0)
+        except Exception as e:
+            print("[AUTO LOOP] exception:", e)
+            time.sleep(2.0)
+
 # ===== PANIC & Runner =====
 @bot.message_handler(commands=["panic"])
 def on_panic(msg):
@@ -546,6 +588,8 @@ def main():
     ensure_single_instance()
     ensure_fetcher()
     _sync_from_tf_trade()   # סינכרון ראשוני
+    t = threading.Thread(target=auto_loop, daemon=True)
+    t.start()
     run_forever()
 
 if __name__ == "__main__":
