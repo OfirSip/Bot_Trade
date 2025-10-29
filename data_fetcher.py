@@ -1,12 +1,11 @@
 # data_fetcher.py
 from __future__ import annotations
 import json, time, threading, asyncio, os, collections
-from typing import Deque, Tuple, Optional, List
+from typing import List, Tuple
 import websockets
 
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
-if not FINNHUB_KEY:
-    raise RuntimeError("Missing FINNHUB_API_KEY")
+HAS_LIVE_KEY = bool(FINNHUB_KEY)
 
 STATE = {
     "ticks": collections.deque(maxlen=6000),  # (ts, price)
@@ -28,7 +27,6 @@ async def _consumer(sym: str):
     STATE["ws_url"] = url
     STATE["current_finnhub_symbol"] = sym
     async with websockets.connect(url, ping_interval=15, ping_timeout=15) as ws:
-        # subscribe
         await ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
         STATE["subscribed"] = [sym]
         STATE["ws_online"] = True
@@ -39,15 +37,20 @@ async def _consumer(sym: str):
             data = json.loads(msg)
             if data.get("type") == "trade":
                 for d in data.get("data", []):
-                    price = float(d.get("p"))
-                    s = d.get("s")
-                    # משתמשים אך ורק בסמל שנבחר
-                    if s != sym: 
+                    if d.get("s") != sym:
                         continue
-                    STATE["used_symbol"] = s
+                    price = float(d.get("p"))
+                    STATE["used_symbol"] = sym
                     STATE["ticks"].append((time.time(), price))
 
 async def _main_loop(sym_getter):
+    # אם אין KEY — אל תקרוס. רק הישאר אופליין והצג זאת בסטטוס.
+    if not HAS_LIVE_KEY:
+        STATE["ws_online"] = False
+        # שמור לולאה ריקה כדי שה-thread ירוץ והסטטוס יעבוד
+        while True:
+            await asyncio.sleep(1.0)
+
     backoff = 2
     max_backoff = 30
     while True:
@@ -61,8 +64,8 @@ async def _main_loop(sym_getter):
             backoff = min(max_backoff, backoff * 2)
 
 def start_fetcher_in_thread(sym_getter):
-    """
-    sym_getter: פונקציה שמחזירה בכל רגע את הסמל הנוכחי (Finnhub), כדי לאפשר שינוי נכס "און דה פליי".
-    """
-    t = threading.Thread(target=lambda: asyncio.new_event_loop().run_until_complete(_main_loop(sym_getter)), daemon=True)
+    t = threading.Thread(
+        target=lambda: asyncio.new_event_loop().run_until_complete(_main_loop(sym_getter)),
+        daemon=True
+    )
     t.start()
