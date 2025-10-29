@@ -1,22 +1,21 @@
-# PO-SignalBot — Finnhub → Signals for Pocket Option (M1/M3)
+# PO-SignalBot — Live FX/CRYPTO Tick Signals → Pocket Option Flow
 
-Telegram bot שמתחבר ל-Finnhub WS, מחשב סיגנלים (EMA alignment + RSI + תנודתיות + slope),
-מייצר ויזואליזציות (גרף PNG) ושולח בטלגרם עם תפריט פשוט להתאמה ל-Pocket Option.
+בוט טלגרם שמתחבר ל-Finnhub WS, מבצע ניתוח מוקטב-רעש multi-signal (טרנד + מומנטום + רג'ים + סטטיסטיקות),
+מייצר סיגנל (UP/DOWN/WAIT) עם Confidence, ומציג ויזואליזציות (גרף/אינדיקטורים) לאימות מהיר מול Pocket Option.
 
-## ENV (Railway / local)
+## ENV
 - TELEGRAM_BOT_TOKEN  — חובה (BotFather)
-- TELEGRAM_CHAT_ID    — אופציונלי (לנעילה לצ'אט יחיד)
-- FINNHUB_API_KEY     — חובה (WS)
+- TELEGRAM_CHAT_ID    — אופציונלי (לנעול לצ'אט יחיד)
+- FINNHUB_API_KEY     — מומלץ (ללא מפתח: הסטטוס יוצג אך אין דאטה חי)
 - SINGLETON_PORT      — אופציונלי (47653)
 
-## פקודות
-- /start — פתיחת תפריט
-- "⚙️ הגדרות" — בחירת expiry (M1/M3), גודל חלון, מינימום confidence וכו׳
-- "📊 נכס" — בחר נכס (Pocket Option סימבולים נפוצים) → ממופה ל-Finnhub
-- "🛰️ סטטוס" — מצב WS/טלמטריה + תקציר אינדיקטורים
-- "🖼️ ויזואל" — גרף PNG של החלון הנוכחי
-- "🧠 סיגנל" — החלטה UP/DOWN + confidence
+## תפריט
+- 📊 נכס — בחר נכס (PO→Finnhub mapping)
+- ⚙️ הגדרות — Expiry (M1/M3), חלון, MinConf, ועוד
+- 🛰️ סטטוס — מצב דאטה + תקציר חישובים (תמיד מוצג)
+- 🖼️ ויזואל — גרף PNG עם EMA, RSI, אזורי רג'ים ותצוגת חלון
+- 🧠 סיגנל — החלטה + Confidence + מיני-דיאגנוסטיקה
 
 ## הערות
-- מיפוי PO→Finnhub בסיסי לדוגמה (EUR/USD → OANDA:EUR_USD). הרחב/עדכן לפי הצורך.
-- אין מסחר אוטומטי פה, רק סיגנלים וויזואליים וסט אפ להצמדה ידנית ל-PO.
+- אין "דמו" בבוט. אם אין מפתח — הסטטוס יוצג כ-MISSING_API_KEY, אבל בלי דאטה חי לא יהיה סיגנל משמעותי.
+- הכוונונים אסטרטגיים ניתנים לשינוי מהבוט. מומלץ לבדוק על חשבון דמו של PO.
