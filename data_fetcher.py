@@ -8,7 +8,7 @@ FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 HAS_LIVE_KEY = bool(FINNHUB_KEY)
 
 STATE = {
-    "ticks": collections.deque(maxlen=6000),  # (ts, price)
+    "ticks": collections.deque(maxlen=8000),  # (ts, price)
     "ws_online": False,
     "used_symbol": None,
     "msg_count": 0,
@@ -44,10 +44,9 @@ async def _consumer(sym: str):
                     STATE["ticks"].append((time.time(), price))
 
 async def _main_loop(sym_getter):
-    # אם אין KEY — אל תקרוס. רק הישאר אופליין והצג זאת בסטטוס.
+    # אם אין KEY — לא לקרוס; נשארים אופליין ומאפשרים סטטוס.
     if not HAS_LIVE_KEY:
         STATE["ws_online"] = False
-        # שמור לולאה ריקה כדי שה-thread ירוץ והסטטוס יעבוד
         while True:
             await asyncio.sleep(1.0)
 
