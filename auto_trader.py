@@ -2,7 +2,8 @@ from __future__ import annotations
 import time, threading
 from dataclasses import dataclass
 from typing import Optional, Literal
-
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException, WebDriverException
@@ -64,16 +65,36 @@ class AutoTrader:
 
     # ---------- Driver ----------
     def _ensure_driver(self):
+        """
+        מוודא שיש דרייבר. במקום להתחבר לדפדפן קיים,
+        הפונקציה הזו תפעיל אחד חדש במצב headless שמתאים לשרת.
+        """
         if self._driver is not None:
             return
+            
         opts = webdriver.ChromeOptions()
-        opts.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
+        # --- הגדרות קריטיות לשרת (Railway/GitHub) ---
+        opts.add_argument("--headless")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage") # חיוני בסביבות Docker
+        opts.add_argument("--window-size=1920,1080")
+        
+        # הערה: הקוד הישן שמתחבר ל-9222 נמחק.
+        # opts.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}" # <-- DELETE THIS LINE
         try:
-            self._driver = webdriver.Chrome(options=opts)
+            # השתמש ב-webdriver_manager כדי להתקין אוטומטית את ה-chromedriver הנכון
+            service = ChromeService(ChromeDriverManager().install())
+            self._driver = webdriver.Chrome(service=service, options=opts)
+            
         except WebDriverException as e:
             self.state.last_error = f"WebDriver error: {e}"
+            self.state.last_action = "error: webdriver init"
+            # אם השגיאה היא 127, זה כנראה אומר ש-Chrome עצמו חסר
+            if "Status code was: 127" in str(e):
+                 self.state.last_error = "WebDriver error 127: 'google-chrome' not found or libs missing. Did you install it in the Dockerfile?"
             raise
 
+    
     def _click(self, xpath: str):
         el = self._driver.find_element(By.XPATH, xpath)
         el.click()
