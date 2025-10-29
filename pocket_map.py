@@ -11,16 +11,15 @@ PO_TO_FINNHUB = {
     "GBP/JPY": "OANDA:GBP_JPY",
     "EUR/GBP": "OANDA:EUR_GBP",
 
-    # Crypto (דוגמה – בדוק זמינות ב-Finnhub)
+    # Crypto (Finnhub sym mapping example)
     "BTC/USD": "BINANCE:BTCUSDT",
     "ETH/USD": "BINANCE:ETHUSDT",
 
-    # OTC (נמפה לבסיס הרגיל; PO מציע OTC בסופ״ש — תן fallback)
+    # OTC aliases → map to base instruments
     "EUR/USD_otc": "OANDA:EUR_USD",
     "GBP/USD_otc": "OANDA:GBP_USD",
     "USD/JPY_otc": "OANDA:USD_JPY",
 }
-DEFAULT_SYMBOL = "OANDA:EUR_USD"
 
-# זמן בררת מחדל ל-expiry בפוקט אופשן (שימוש כמטא בלבד)
+DEFAULT_SYMBOL = "OANDA:EUR_USD"
 SUPPORTED_EXPIRIES = ["M1", "M3"]
