@@ -1,4 +1,3 @@
-# auto_trader.py
 from __future__ import annotations
 import time, threading
 from dataclasses import dataclass
@@ -25,9 +24,13 @@ class AutoState:
     last_side: Optional[Side] = None
     last_error: Optional[str] = None
     last_action: Optional[str] = None
-    conf_threshold: int = 72         # סף ביטחון ברירת מחדל
-    min_interval_sec: int = 15       # מינימום זמן בין טריידים
-    anti_burst_sec: int = 5          # לא להיכנס פעמיים אותו כיוון מהר
+    conf_threshold: int = 72       # סף ביטחון ברירת מחדל
+    min_interval_sec: int = 15     # מינימום זמן בין טריידים
+    anti_burst_sec: int = 5        # לא להיכנס פעמיים אותו כיוון מהר
+    
+    # --- הוספות חדשות ---
+    last_check_ts: float = 0.0     # מתי הלולאה האוטומטית בדקה לאחרונה
+    log_verbose: bool = False      # האם לדווח על עסקאות שנחסמו
 
 class AutoTrader:
     """
@@ -48,6 +51,8 @@ class AutoTrader:
         with self._lock:
             self.state.enabled = on
             self.state.last_action = "enabled" if on else "disabled"
+            if not on:
+                self.state.last_check_ts = 0.0 # אפס בעת כיבוי
 
     def set_conf_threshold(self, v: int):
         with self._lock:
@@ -75,6 +80,7 @@ class AutoTrader:
 
     # ---------- Trade ----------
     def place_trade(self, side: Side) -> bool:
+        """מנסה לבצע עסקה אוטומטית, מכבד את כל המגבלות"""
         with self._lock:
             if not self.state.enabled:
                 self.state.last_action = "ignored: auto OFF"
@@ -107,17 +113,49 @@ class AutoTrader:
                 self.state.last_action = "error: webdriver"
                 return False
 
+    def force_manual_trade(self, side: Side) -> bool:
+        """מבצע לחיצה ידנית בכוח, ללא קשר למצב 'enabled' או מגבלות (למעט נעילה)"""
+        with self._lock:
+            now = time.time()
+            try:
+                self._ensure_driver()
+                if side == "UP":
+                    self._click(XPATH_UP)
+                else:
+                    self._click(XPATH_DOWN)
+                
+                # אנחנו עדיין רושמים את זמן הלחיצה כדי שה-auto-trader יכבד אותה
+                self.state.last_trade_ts = now
+                self.state.last_side = side
+                self.state.last_error = None
+                self.state.last_action = f"MANUAL clicked {side}"
+                return True
+            except NoSuchElementException:
+                self.state.last_error = f"xpath not found for {side} (manual)"
+                self.state.last_action = "error: manual xpath not found"
+                return False
+            except WebDriverException as e:
+                self.state.last_error = f"webdriver error: {e} (manual)"
+                self.state.last_action = "error: manual webdriver"
+                return False
+
     # ---------- Status ----------
     def status_lines(self) -> list[str]:
         with self._lock:
+            last_check_str = "n/a"
+            if self.state.last_check_ts > 0:
+                last_check_str = time.strftime('%H:%M:%S', time.localtime(self.state.last_check_ts))
+
             return [
                 f"AUTO: {'ON' if self.state.enabled else 'OFF'}",
                 f"Conf threshold: {self.state.conf_threshold}",
                 f"Min interval: {self.state.min_interval_sec}s",
                 f"Anti-burst: {self.state.anti_burst_sec}s",
+                f"Verbose Log: {'ON' if self.state.log_verbose else 'OFF'}", # הוספה
                 f"Chrome debug: {DEBUG_HOST}:{DEBUG_PORT}",
                 f"XPATH UP: {XPATH_UP}",
                 f"XPATH DOWN: {XPATH_DOWN}",
+                f"Last check: {last_check_str}", # הוספה
                 f"Last action: {self.state.last_action or 'n/a'}",
                 f"Last error: {self.state.last_error or 'none'}",
             ]
