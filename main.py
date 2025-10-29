@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 import os, sys, time, socket, io, collections, threading
 import telebot
@@ -8,7 +7,7 @@ from telebot.apihelper import delete_webhook, ApiTelegramException
 from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL
 from data_fetcher import STATE, start_fetcher_in_thread, HAS_LIVE_KEY
 from strategy import decide_from_ticks, CFG as STRAT_CFG
-from auto_trader import AutoTrader
+from auto_trader import AutoTrader # מיובא מהקובץ המעודכן
 
 # ===== גרף =====
 import matplotlib
@@ -27,8 +26,8 @@ class BotState:
     def __init__(self):
         self.po_asset: str = "EUR/USD"
         self.finnhub_symbol: str = PO_TO_FINNHUB.get(self.po_asset, DEFAULT_SYMBOL)
-        self.chart_mode: str = "CANDLE"   # "CANDLE" / "LINE"
-        self.candle_tf_sec: int = 60      # ב-LINE מוצג כ-N/A
+        self.chart_mode: str = "CANDLE"  # "CANDLE" / "LINE"
+        self.candle_tf_sec: int = 60     # ב-LINE מוצג כ-N/A
         self.trade_expiry_sec: int = 60
         self.window_sec: int = 26
         # ביצועים יומיים
@@ -173,6 +172,8 @@ def main_menu_markup():
     kb.add(types.KeyboardButton("🛰️ סטטוס"), types.KeyboardButton("🖼️ ויזואל"))
     kb.add(types.KeyboardButton("🧠 סיגנל"))
     kb.add(types.KeyboardButton("🤖 מסחר אוטומטי"), types.KeyboardButton("⚙️ Auto-Settings"))
+    # --- הוספה ---
+    kb.add(types.KeyboardButton("🔼 MANUAL UP"), types.KeyboardButton("🔽 MANUAL DOWN"))
     return kb
 
 def asset_inline_keyboard(page: int = 0, page_size: int = 6):
@@ -428,9 +429,9 @@ def on_status(msg):
         f"Tick imbalance: {_fmt(dbg.get('tick_imb'), '.2f')}",
         f"Align bonus: {_fmt(dbg.get('align_bonus'), '.2f')}",
         "",
-        "Auto-Trading",
+        "--- Auto-Trading ---", # כותרת ברורה
     ]
-    lines += AUTO.status_lines()
+    lines += AUTO.status_lines() # הפונקציה המעודכנת תציג את השדות החדשים
     bot.send_message(msg.chat.id, "\n".join(lines), reply_markup=main_menu_markup())
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🖼️ ויזואל")
@@ -512,7 +513,7 @@ def on_auto_toggle(msg):
         bot.send_message(msg.chat.id, "Auto-Trading: OFF", reply_markup=main_menu_markup())
     else:
         AUTO.enable()
-        bot.send_message(msg.chat.id, "Auto-Trading: ON", reply_markup=main_menu_markup())
+        bot.send_message(msg.chat.id, "Auto-Trading: ON (בודק עסקאות ברקע...)", reply_markup=main_menu_markup())
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "⚙️ Auto-Settings")
 def on_auto_settings(msg):
@@ -525,39 +526,122 @@ def on_auto_settings(msg):
         types.InlineKeyboardButton("Interval −5s", callback_data="auto::ival:-5"),
         types.InlineKeyboardButton("Interval +5s", callback_data="auto::ival:+5"),
     )
+    # --- הוספה ---
+    kb.add(types.InlineKeyboardButton(
+        f"Toggle Verbose Log: {'ON' if AUTO.state.log_verbose else 'OFF'}", 
+        callback_data="auto::log_toggle"
+    ))
     kb.add(types.InlineKeyboardButton("סטטוס אוטו", callback_data="auto::status"))
-    bot.send_message(msg.chat.id, "שנה סף ביטחון/מרווח זמן:", reply_markup=kb)
+    bot.send_message(msg.chat.id, "שנה סף ביטחון/מרווח זמן/לוגים:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto::"))
 def on_auto_cb(c):
-    _, kind, val = c.data.split("::")
+    if not c.data.startswith("auto::"): return
+    
+    parts = c.data.split("::")
+    if len(parts) < 2: return
+    
+    kind = parts[1]
+    val = parts[2] if len(parts) > 2 else None
+
     if kind == "conf":
         AUTO.set_conf_threshold(AUTO.state.conf_threshold + int(val))
         bot.answer_callback_query(c.id, text=f"Conf ≥ {AUTO.state.conf_threshold}")
     elif kind == "ival":
         AUTO.set_min_interval(AUTO.state.min_interval_sec + int(val))
         bot.answer_callback_query(c.id, text=f"Interval = {AUTO.state.min_interval_sec}s")
+    # --- הוספה ---
+    elif kind == "log_toggle":
+        AUTO.state.log_verbose = not AUTO.state.log_verbose
+        bot.answer_callback_query(c.id, text=f"Verbose Log: {'ON' if AUTO.state.log_verbose else 'OFF'}")
     elif kind == "status":
         bot.answer_callback_query(c.id, text="Auto status")
-    bot.edit_message_text(
-        chat_id=c.message.chat.id,
-        message_id=c.message.message_id,
-        text="\n".join(AUTO.status_lines()),
-        reply_markup=None
-    )
+    
+    # עדכון ההודעה המקורית עם הסטטוס המעודכן
+    try:
+        kb = c.message.reply_markup
+        if kind == "log_toggle" and kb:
+            # עדכן את הטקסט של הכפתור
+            for row in kb.keyboard:
+                for button in row:
+                    if button.callback_data == "auto::log_toggle":
+                        button.text = f"Toggle Verbose Log: {'ON' if AUTO.state.log_verbose else 'OFF'}"
+                        
+        bot.edit_message_text(
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            text="--- Auto-Trading Status ---\n" + "\n".join(AUTO.status_lines()),
+            reply_markup=kb if kind != "status" else None # הסר מקלדת אם לחצו סטטוס
+        )
+    except ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+             bot.answer_callback_query(c.id, text="Error updating status.")
+    except Exception:
+        bot.answer_callback_query(c.id, text="Error updating status.")
 
-# ===== לולאת החלטה רקע למסחר אוטומטי =====
+
+# ===== מסחר ידני: תפעול (חדש) =====
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "🔼 MANUAL UP")
+def on_manual_up(msg):
+    bot.send_message(msg.chat.id, "שולח לחיצת UP ידנית...", reply_markup=main_menu_markup())
+    success = AUTO.force_manual_trade("UP")
+    if success:
+        bot.send_message(msg.chat.id, "✅ לחיצה ידנית בוצעה (UP).")
+    else:
+        bot.send_message(msg.chat.id, f"❌ נכשל בלחיצה ידנית (UP). שגיאה:\n{AUTO.state.last_error}")
+
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "🔽 MANUAL DOWN")
+def on_manual_down(msg):
+    bot.send_message(msg.chat.id, "שולח לחיצת DOWN ידנית...", reply_markup=main_menu_markup())
+    success = AUTO.force_manual_trade("DOWN")
+    if success:
+        bot.send_message(msg.chat.id, "✅ לחיצה ידנית בוצעה (DOWN).")
+    else:
+        bot.send_message(msg.chat.id, f"❌ נכשל בלחיצה ידנית (DOWN). שגיאה:\n{AUTO.state.last_error}")
+
+
+# ===== לולאת החלטה רקע למסחר אוטומטי (שכתוב מלא) =====
 def auto_loop():
+    """
+    לולאת רקע שבודקת ומבצעת מסחר אוטומטי.
+    מדווחת ל-CHAT_LOCK על הצלחות, ועל חסימות אם log_verbose=True.
+    """
     while True:
         try:
             if AUTO.state.enabled:
+                # 1. עדכן חותמת זמן לבדיקה (כדי שסטטוס יראה שהלולאה חיה)
+                AUTO.state.last_check_ts = time.time()
+                
                 side, conf, _dbg = decide_from_ticks(STATE["ticks"])
-                if side in ("UP","DOWN") and conf >= AUTO.state.conf_threshold:
-                    AUTO.place_trade(side)
-            time.sleep(2.0)
+                
+                is_trade_signal = side in ("UP", "DOWN") and conf >= AUTO.state.conf_threshold
+                
+                if is_trade_signal:
+                    # 2. זוהה סיגנל חזק. נסה לבצע עסקה.
+                    success = AUTO.place_trade(side)
+                    
+                    if success:
+                        # 3. הצלחה! העסקה בוצעה. דווח תמיד.
+                        if CHAT_LOCK:
+                            bot.send_message(CHAT_LOCK, f"✅🤖 AUTO-TRADE PLACED: {side} @ {conf}%")
+                    else:
+                        # 4. נכשל (נחסם ע"י interval/burst guard). דווח רק אם verbose.
+                        if AUTO.state.log_verbose and CHAT_LOCK:
+                            bot.send_message(CHAT_LOCK, f"⚠️🤖 Auto-Trade BLOCKED: {side} @ {conf}%. Reason: {AUTO.state.last_action}")
+                
+                # 5. אם אין סיגנל (conf נמוך / side=WAIT) - אל תעשה כלום ואל תדווח (למניעת ספאם).
+                
+            time.sleep(2.0) # בדוק כל 2 שניות
+            
         except Exception as e:
-            print("[AUTO LOOP] exception:", e)
-            time.sleep(2.0)
+            print(f"[AUTO LOOP] exception: {e}")
+            if CHAT_LOCK:
+                try:
+                    # דווח על שגיאה חריגה בלולאה
+                    bot.send_message(CHAT_LOCK, f"💥 AUTO LOOP ERROR: {e}")
+                except Exception:
+                    pass
+            time.sleep(5.0) # המתן קצת יותר זמן לאחר שגיאה
 
 # ===== PANIC & Runner =====
 @bot.message_handler(commands=["panic"])
@@ -588,8 +672,11 @@ def main():
     ensure_single_instance()
     ensure_fetcher()
     _sync_from_tf_trade()   # סינכרון ראשוני
+    
+    # הפעל את הלולאה האוטומטית כ-Thread נפרד
     t = threading.Thread(target=auto_loop, daemon=True)
     t.start()
+    
     run_forever()
 
 if __name__ == "__main__":
