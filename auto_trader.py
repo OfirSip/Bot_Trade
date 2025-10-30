@@ -44,7 +44,7 @@ class AutoState:
     threshold_aggr: int = DEFAULT_THRESHOLD_AGGR   # סף "אגרסיבי" (בדרך כלל קצת יותר גבוה)
     min_interval_sec: int = DEFAULT_MIN_INTERVAL_SEC
 
-    last_action: Optional[str] = None            # "BUY↑" / "SELL↓" / "SKIP"
+    last_action: Optional[str] = None            # "BUY↑" / "SELL↓" / "SKIP" / "MANUAL BUY↑"
     last_action_ts: float = 0.0                  # מתי ביצענו טרייד אחרון בפועל
     last_error: Optional[str] = None             # לשמירת שגיאה פנימית אחרונה (debug)
 
@@ -146,6 +146,33 @@ class AutoTrader:
         else:
             self._remember("SKIP", "failed click")
 
+        return ok
+
+    # ================================================================
+    # שדרוג: פונקציות ללחיצה ידנית מהבוט
+    # ================================================================
+    def manual_click_up(self) -> bool:
+        """
+        כופה לחיצה על UP (ידני).
+        עוקף את כל הבדיקות.
+        """
+        ok = self._click_xpath(XPATH_UP)
+        if ok:
+            self._remember("MANUAL BUY↑", None)
+        else:
+            self._remember("MANUAL BUY↑", "failed click")
+        return ok
+
+    def manual_click_down(self) -> bool:
+        """
+        כופה לחיצה על DOWN (ידני).
+        עוקף את כל הבדיקות.
+        """
+        ok = self._click_xpath(XPATH_DOWN)
+        if ok:
+            self._remember("MANUAL SELL↓", None)
+        else:
+            self._remember("MANUAL SELL↓", "failed click")
         return ok
 
     # ------------------------------------------------------------------
