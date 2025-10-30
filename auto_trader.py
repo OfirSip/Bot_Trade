@@ -6,7 +6,7 @@ from typing import Optional, Literal
 
 Side = Literal["UP", "DOWN"]
 
-# ננסה לייבא Selenium. אם אין, נשאר במצב פסיבי.
+# ננסה לייבא Selenium. אם אין - DRY mode.
 SELENIUM_OK = True
 try:
     from selenium import webdriver
@@ -16,10 +16,11 @@ except Exception:
     SELENIUM_OK = False
     webdriver = By = NoSuchElementException = WebDriverException = object  # type: ignore
 
+# כתובת החיבור ל-Chrome שהרצת עם --remote-debugging-port=9222
 DEBUG_HOST = "127.0.0.1"
 DEBUG_PORT = 9222
 
-# XPaths של כפתורי BUY/SELL ב-PO
+# ה-XPaths לכפתורי BUY ו-SELL שהבאת
 XPATH_UP   = "//div[contains(@class,'action-high-low') and contains(@class,'button-call-wrap')]//a[contains(@class,'btn-call')]"
 XPATH_DOWN = "//div[contains(@class,'action-high-low') and contains(@class,'button-put-wrap')]//a[contains(@class,'btn-put')]"
 
@@ -31,23 +32,22 @@ class AutoState:
     last_error: Optional[str] = None
     last_action: Optional[str] = None
 
-    # thresholds:
     threshold_enter: int = 72        # כניסה רגילה
-    threshold_aggr: int  = 65        # כניסה אגרסיבית (דורש תנאים מחמירים)
-    min_interval_sec: int = 15       # מניעת ספאם רצוף
-    anti_flip_sec: int   = 5         # בלימת היפוך מהיר
+    threshold_aggr: int  = 65        # כניסה אגרסיבית (רק אם strong_ok)
+    min_interval_sec: int = 15       # מניעת ספאם
+    anti_flip_sec: int   = 5         # לא להפוך כיוון מהר מדי
 
-    # telemetry:
     last_attempt_side: Optional[Side] = None
     last_attempt_conf: Optional[int] = None
     last_decision_reason: Optional[str] = None
 
+
 class AutoTrader:
     """
-    מחובר ל-Chrome שעובד בדיבאג:
-      chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\ChromeDev"
-    אם Selenium לא זמין → לא לוחץ בפועל אבל עדיין "מסביר מה היה קורה".
+    מטפל בלחיצה אוטומטית בפוקט אופשן אם כרום מחובר בדיבאג.
+    אם Selenium לא קיים -> DRY: רק מדווח מה היה עושה.
     """
+
     def __init__(self):
         self.state = AutoState()
         self._driver = None
@@ -88,6 +88,8 @@ class AutoTrader:
         if self._driver is not None:
             return
         opts = webdriver.ChromeOptions()  # type: ignore[attr-defined]
+        # מאוד חשוב: אתה חייב להריץ כרום מקומי עם:
+        # chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\ChromeDev"
         opts.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"  # type: ignore[attr-defined]
         self._driver = webdriver.Chrome(options=opts)  # type: ignore[call-arg]
 
@@ -98,22 +100,19 @@ class AutoTrader:
         el.click()
 
     def can_trade_now(self, side: Side, conf: int, strong_ok: bool, now: float) -> (bool,str):
-        """
-        strong_ok = האם זה סיגנל איכותי חזק (הסכמה של טווחים וכו')
-        """
         if not self.state.enabled:
             return False, "auto OFF"
 
-        # anti-spam
+        # אנטי ספאם
         dt = now - self.state.last_trade_ts
         if dt < self.state.min_interval_sec:
             return False, f"cooldown {self.state.min_interval_sec-dt:.1f}s left"
 
-        # anti-flip
+        # אנטי היפוך
         if self.state.last_side and self.state.last_side != side and dt < self.state.anti_flip_sec:
             return False, "anti-flip guard"
 
-        # decide threshold logic
+        # קבלת החלטה לפי thresholds
         if conf >= self.state.threshold_enter:
             return True, ">=enter threshold"
         if conf >= self.state.threshold_aggr and strong_ok:
@@ -124,6 +123,7 @@ class AutoTrader:
         with self._lock:
             now = time.time()
             ok, reason = self.can_trade_now(side, conf, strong_ok, now)
+
             self.state.last_attempt_side = side
             self.state.last_attempt_conf = conf
             self.state.last_decision_reason = reason
@@ -132,7 +132,7 @@ class AutoTrader:
                 self.state.last_action = f"skipped ({reason})"
                 return False
 
-            # אפילו אם ok, יכול להיות שאין selenium בפועל
+            # מצב DRY אם אין Selenium
             if not SELENIUM_OK:
                 self.state.last_error = "no selenium (dry)"
                 self.state.last_action = f"DRY would {side}"
@@ -140,18 +140,20 @@ class AutoTrader:
                 self.state.last_side = side
                 return True
 
-            # אמור לבצע קליק אמיתי
+            # נסה באמת ללחוץ
             try:
                 self._ensure_driver()
                 if side == "UP":
                     self._click_xpath(XPATH_UP)
                 else:
                     self._click_xpath(XPATH_DOWN)
+
                 self.state.last_trade_ts = now
                 self.state.last_side = side
                 self.state.last_error = None
                 self.state.last_action = f"clicked {side}"
                 return True
+
             except NoSuchElementException:
                 self.state.last_error = "xpath not found"
                 self.state.last_action = "error: xpath"
