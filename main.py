@@ -1163,6 +1163,7 @@ def run_forever():
 def main():
     ensure_single_instance()
     ensure_fetcher()
+    init_learner_from_remote()
     sync_from_tf_trade()
     t = threading.Thread(target=auto_loop, daemon=True)
     t.start()
