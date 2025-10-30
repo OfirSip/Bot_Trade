@@ -1,4 +1,3 @@
-# data_fetcher.py
 from __future__ import annotations
 import json, time, threading, asyncio, os, collections
 from typing import List, Tuple
@@ -8,7 +7,8 @@ FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 HAS_LIVE_KEY = bool(FINNHUB_KEY)
 
 STATE = {
-    "ticks": collections.deque(maxlen=8000),  # (ts, price)
+    "ticks": collections.deque(maxlen=8000),
+    "lock": threading.Lock(),
     "ws_online": False,
     "used_symbol": None,
     "msg_count": 0,
@@ -41,10 +41,10 @@ async def _consumer(sym: str):
                         continue
                     price = float(d.get("p"))
                     STATE["used_symbol"] = sym
-                    STATE["ticks"].append((time.time(), price))
+                    with STATE["lock"]:
+                        STATE["ticks"].append((time.time(), price))
 
 async def _main_loop(sym_getter):
-    # אם אין KEY — לא לקרוס; נשארים אופליין ומאפשרים סטטוס.
     if not HAS_LIVE_KEY:
         STATE["ws_online"] = False
         while True:
