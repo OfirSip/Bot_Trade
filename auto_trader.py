@@ -9,6 +9,11 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
+# --- שדרוג: הוספת ספריות ל-Explicit Wait ---
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# --- סוף שדרוג ---
+
 
 # =====================================================================================
 # קונפיג מהסביבה
@@ -27,10 +32,17 @@ DEFAULT_MIN_INTERVAL_SEC = int(os.getenv("AUTO_MIN_INTERVAL_SEC", "15").strip())
 DEFAULT_THRESHOLD_ENTER = int(os.getenv("AUTO_THRESHOLD_ENTER", "70").strip())
 DEFAULT_THRESHOLD_AGGR  = int(os.getenv("AUTO_THRESHOLD_AGGR", "80").strip())
 
-# XPaths של הכפתורים בפוקט אופשן
-# אלה הגיעו ממך. אם ה-HTML משתנה בפוקט, תעדכן פה.
-XPATH_UP = "//div[contains(@class,'action-high-low') and contains(@class,'button-call-wrap')]//a[contains(@class,'btn') and contains(@class,'btn-call')]"
-XPATH_DOWN = "//div[contains(@class,'action-high-low') and contains(@class,'button-put-wrap')]//a[contains(@class,'btn') and contains(@class,'btn-put')]"
+
+# ================================================================
+# שדרוג: פישוט ה-XPaths כדי להיות עמידים יותר לשינויי HTML
+# ================================================================
+# התמקדות בכיתה הייחודית של הכפתור עצמו (<a>)
+# במקום להסתמך על ה-DIV החיצוני
+XPATH_UP = "//a[contains(@class,'btn-call')]"
+XPATH_DOWN = "//a[contains(@class,'btn-put')]"
+# ================================================================
+# סוף שדרוג
+# ================================================================
 
 
 # =====================================================================================
@@ -102,22 +114,12 @@ class AutoTrader:
         """
         מנסה לבצע טרייד אוטומטי לפי סיגנל.
         החזרה היא True אם באמת בוצעה לחיצה BUY/SELL.
-        תנאים:
-        - האוטומציה דולקת
-        - הכיוון הוא "UP" או "DOWN"
-        - conf עומד בספים
-        - עבר מספיק זמן מהעסקה הקודמת
-        side: "UP" / "DOWN"
-        conf: ביטחון (אחוזים)
-        strong_ok: האם הבוט העריך שזה איתות איכותי (🟩 Strong + הסכמה בטיימפריימים)
         """
         if not self.state.enabled:
             self._remember("SKIP", "Auto disabled")
             return False
 
         # דרישת ביטחון:
-        # אם זה strong_ok, אפשר להסתפק ב-threshold_enter
-        # אחרת נבקש threshold_aggr
         required = self.state.threshold_enter if strong_ok else self.state.threshold_aggr
         if conf < required:
             self._remember("SKIP", f"conf {conf} < required {required}")
@@ -144,7 +146,8 @@ class AutoTrader:
         if ok:
             self._remember(label, None)
         else:
-            self._remember("SKIP", "failed click")
+            # השגיאה עצמה נרשמה ב- _click_xpath
+            self._remember("SKIP", f"failed click: {self.state.last_error}")
 
         return ok
 
@@ -160,7 +163,8 @@ class AutoTrader:
         if ok:
             self._remember("MANUAL BUY↑", None)
         else:
-            self._remember("MANUAL BUY↑", "failed click")
+            # שדרוג: רושם את השגיאה האמיתית
+            self._remember("MANUAL BUY↑", f"click fail: {self.state.last_error}")
         return ok
 
     def manual_click_down(self) -> bool:
@@ -172,7 +176,8 @@ class AutoTrader:
         if ok:
             self._remember("MANUAL SELL↓", None)
         else:
-            self._remember("MANUAL SELL↓", "failed click")
+            # שדרוג: רושם את השגיאה האמיתית
+            self._remember("MANUAL SELL↓", f"click fail: {self.state.last_error}")
         return ok
 
     # ------------------------------------------------------------------
@@ -216,6 +221,12 @@ class AutoTrader:
             # חשוב: כאן אנחנו מניחים שיש לך דרייבר כרום תואם במכונה הזאת
             # (chromedriver תואם לגרסת הכרום שאתה מריץ).
             self._driver = webdriver.Chrome(options=chrome_opts)
+            
+            # --- שדרוג: הגדרת Implicit Wait פעם אחת ---
+            # נותן לסלניום כמה שניות למצוא אלמנט לפני שהוא נכשל
+            self._driver.implicitly_wait(3) 
+            # --- סוף שדרוג ---
+
             return True
 
         except Exception as e:
@@ -232,13 +243,21 @@ class AutoTrader:
     def _click_xpath(self, xpath: str) -> bool:
         """
         מנסה להתחבר לכרום ואז ללחוץ על האלמנט לפי ה-XPath.
+        --- שדרוג: משתמש ב-WebDriverWait כדי לחכות שהכפתור יהיה לחיץ ---
         """
         try:
             if not self._connect_driver_if_needed():
+                # שגיאת החיבור תירשם ב- _connect_driver_if_needed
                 return False
 
-            # חיפוש האלמנט
-            el = self._driver.find_element(By.XPATH, xpath)
+            # --- שדרוג: Explicit Wait ---
+            # המתן עד 5 שניות עד שהאלמנט יהיה גם נוכח וגם לחיץ (clickable)
+            # זה פותר בעיות של טעינה דינמית או חפיפה זמנית של אלמנטים
+            wait = WebDriverWait(self._driver, 5)
+            el = wait.until(
+                EC.element_to_be_clickable((By.XPATH, xpath))
+            )
+            # --- סוף שדרוג ---
 
             # לחיצה
             el.click()
@@ -246,16 +265,9 @@ class AutoTrader:
 
         except Exception as e:
             # נרשום שגיאה בשביל סטטוס
-            self.state.last_error = f"click fail: {e}"
+            # חותך את השגיאה כדי שהיא לא תהיה ארוכה מדי להודעת טלגרם
+            error_msg = str(e).split("\n")[0]
+            self.state.last_error = f"click fail: {error_msg}"
             traceback.print_exc()
-
-            # אם היתה בעיה גדולה (נגיד חלון נסגר), ננתק את הדרייבר
-            try:
-                if self._driver:
-                    # אל תעשה quit() מיידית בכל טעות קטנה, אבל
-                    # אם זה באמת בעיית חיבור/דפדפן מת -> אפשר לשקול כן.
-                    pass
-            except Exception:
-                pass
 
             return False
