@@ -432,6 +432,11 @@ def pc_menu():
     kb.add(types.KeyboardButton("🧠 סיגנל"), types.KeyboardButton("🖼️ ויזואל"))
     kb.add(types.KeyboardButton("🛰️ סטטוס"), types.KeyboardButton("📈 ביצועים"))
     kb.add(types.KeyboardButton("🤖 מסחר אוטומטי"), types.KeyboardButton("⚙️ Auto-Settings"))
+    
+    # --- שדרוג: כפתורי מסחר ידני ---
+    kb.add(types.KeyboardButton("🟢 קנה (ידני)"), types.KeyboardButton("🔴 מכור (ידני)"))
+    # --- סוף שדרוג ---
+    
     kb.add(types.KeyboardButton("✅ פגיעה"), types.KeyboardButton("❌ החטאה"))
     kb.add(types.KeyboardButton("📘 הוראות"))
     return kb
@@ -567,6 +572,7 @@ def get_decision():
         "persist": dbg.get("persist"),
         "tick_imb": dbg.get("tick_imb"),
         "align_bonus": dbg.get("align_bonus"),
+        "penalty": dbg.get("penalty"),
         "strong_ok": strong_ok,
     }
 
@@ -869,6 +875,7 @@ def on_signal(msg):
         f"RSI: {_fmt(info['rsi'],'.1f')} | Vol: {_fmt(info['vol'],'.2e')}",
         f"ema_spread: {_fmt(info['ema_spread'])} | slope: {_fmt(info['trend_slope'])}",
         f"persist: {_fmt(info['persist'],'.2f')} | tick_imb: {_fmt(info['tick_imb'],'.2f')} | align_bonus: {_fmt(info['align_bonus'],'.2f')}",
+        f"Risk Penalty: {_fmt(info['penalty'], '.2f')}", # הוספנו את פלט הקנס
         APP.guard.status_line(),
     ]
 
@@ -941,6 +948,7 @@ def on_status(msg):
         f"Persistence: {_fmt(info['persist'],'.2f')}",
         f"Tick imbalance: {_fmt(info['tick_imb'],'.2f')}",
         f"Align bonus: {_fmt(info['align_bonus'],'.2f')}",
+        f"Risk Penalty: {_fmt(info['penalty'], '.2f')}", # הוספנו את פלט הקנס
         "",
         "Market Guard",
         APP.guard.status_line(),
@@ -1074,6 +1082,50 @@ def on_auto_cb(c):
         text="\n".join(AUTO.status_lines()),
         reply_markup=None
     )
+
+
+# =========================================================
+# שדרוג: מסחר ידני (PC)
+# =========================================================
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "🟢 קנה (ידני)")
+def on_manual_buy(msg):
+    if APP.session_mode != "PC":
+        bot.send_message(msg.chat.id, "פקודה זו זמינה רק במצב מחשב 💻.", reply_markup=current_menu())
+        return
+    
+    bot.send_message(msg.chat.id, "מנסה לבצע לחיצת BUY...", reply_markup=current_menu())
+    
+    # קורא לפונקציה החדשה ב-AutoTrader
+    ok = AUTO.manual_click_up()
+    
+    if ok:
+        bot.send_message(msg.chat.id, "✅ בוצע BUY.", reply_markup=current_menu())
+    else:
+        bot.send_message(
+            msg.chat.id,
+            f"❌ לחיצת BUY נכשלה.\nשגיאה: {AUTO.state.last_error}",
+            reply_markup=current_menu()
+        )
+
+@bot.message_handler(func=lambda m: allowed(m) and m.text == "🔴 מכור (ידני)")
+def on_manual_sell(msg):
+    if APP.session_mode != "PC":
+        bot.send_message(msg.chat.id, "פקודה זו זמינה רק במצב מחשב 💻.", reply_markup=current_menu())
+        return
+    
+    bot.send_message(msg.chat.id, "מנסה לבצע לחיצת SELL...", reply_markup=current_menu())
+
+    # קורא לפונקציה החדשה ב-AutoTrader
+    ok = AUTO.manual_click_down()
+    
+    if ok:
+        bot.send_message(msg.chat.id, "✅ בוצע SELL.", reply_markup=current_menu())
+    else:
+        bot.send_message(
+            msg.chat.id,
+            f"❌ לחיצת SELL נכשלה.\nשגיאה: {AUTO.state.last_error}",
+            reply_markup=current_menu()
+        )
 
 
 # =========================================================
