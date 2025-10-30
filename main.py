@@ -5,8 +5,8 @@ import telebot
 from telebot import types
 from telebot.apihelper import delete_webhook, ApiTelegramException
 
-from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL
 from data_fetcher import STATE, start_fetcher_in_thread, HAS_LIVE_KEY
+from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL
 from strategy import decide_from_ticks, CFG as STRAT_CFG
 from auto_trader import AutoTrader
 from learn import LEARNER
@@ -17,68 +17,156 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FormatStrFormatter
 
 
-# ===========================
-# קבועי תפריט / בחירות
-# ===========================
+# =========================================================
+# קבועים קצרים לבחירות משתמש
+# =========================================================
 CANDLE_CHOICES = [("10s",10),("15s",15),("30s",30),("1m",60),("2m",120),("3m",180),("5m",300)]
 TRADE_CHOICES  = [("10s",10),("30s",30),("1m",60),("2m",120),("3m",180),("5m",300)]
 WINDOW_CHOICES = [16,22,26,30,45,60,90]
 CHART_MODES    = ["CANDLE","LINE"]
 
 
-class AssetConfig:
-    """
-    הגדרות אישיות לכל נכס (כדי שכשאתה מחליף נכס, אנחנו מחזירים אותך
-    למצב שעבדת איתו שם בפעם הקודמת).
-    """
+# =========================================================
+# MarketGuardState
+# מנהל מצב שוק (NORMAL / CAUTION / REVERSAL)
+# עוצר מסחר אוטומטי בקירור, מאריך קירור אם צריך,
+# ושולח התראות כשמשהו מסוכן או כשחזר להיות בטוח.
+# =========================================================
+class MarketGuardState:
     def __init__(self):
-        self.chart_mode: str = "CANDLE"
-        self.candle_tf_sec: int = 60
-        self.trade_expiry_sec: int = 60
-        self.window_sec: int = 26
-        self.daily_hits = collections.defaultdict(int)
-        self.daily_miss = collections.defaultdict(int)
+        self.mode: str = "NORMAL"           # NORMAL / CAUTION / REVERSAL
+        self.last_change_ts: float = 0.0     # מתי נכנסנו למצב הזה
+        self.last_alert_mode: str = "NORMAL" # כדי לא להציף באותו טקסט שוב
+        self.cooldown_override_until: float = 0.0  # תוספת זמן קירור אם עדיין מסוכן
+
+    def _base_cooldown(self) -> float:
+        if self.mode == "CAUTION":
+            return 60.0        # עצירה ~דקה
+        if self.mode == "REVERSAL":
+            return 300.0       # עצירה ~5 דקות
+        return 0.0
+
+    def cooldown_active(self) -> bool:
+        """
+        האם עדיין אסור לסחור אוטומטית.
+        מתקבל ע"י הזמן שעבר מאז שנכנסנו למצב + הארכות.
+        """
+        now = time.time()
+        base_left = self._base_cooldown() - (now - self.last_change_ts)
+        extra_left = self.cooldown_override_until - now
+        return (base_left > 0) or (extra_left > 0)
+
+    def status_line(self) -> str:
+        if self.mode == "NORMAL":
+            return "MarketGuard: ✅ Normal"
+        elif self.mode == "CAUTION":
+            return "MarketGuard: ⚠️ Caution (cooldown active)" if self.cooldown_active() else "MarketGuard: ⚠️ Caution (cooldown done)"
+        else:
+            return "MarketGuard: ⛔ Reversal (cooldown active)" if self.cooldown_active() else "MarketGuard: ⛔ Reversal (cooldown done)"
+
+    def set_mode(self, new_mode: str, extend: bool=False) -> bool:
+        """
+        מחזיר True אם עברנו למצב אחר.
+        extend=True -> אם כבר במצב CAUTION/REVERSAL פשוט מאריך את הקירור.
+        """
+        now = time.time()
+
+        # אותו מצב שוב -> אולי רק להאריך קירור
+        if new_mode == self.mode:
+            if extend and new_mode == "REVERSAL":
+                self.cooldown_override_until = max(self.cooldown_override_until, now + 120.0)
+            if extend and new_mode == "CAUTION":
+                self.cooldown_override_until = max(self.cooldown_override_until, now + 30.0)
+            return False
+
+        # עברנו למצב חדש
+        self.mode = new_mode
+        self.last_change_ts = now
+
+        # אתחול קירור בהתחלה
+        if new_mode == "NORMAL":
+            self.cooldown_override_until = 0.0
+        elif new_mode == "CAUTION":
+            self.cooldown_override_until = now + 30.0
+        elif new_mode == "REVERSAL":
+            self.cooldown_override_until = now + 120.0
+
+        return True
+
+    def should_notify_change(self) -> str | None:
+        """
+        אם המצב השתנה מאז ההתראה האחרונה -> מחזיר טקסט התראה חד-פעמי.
+        גם מעדכן last_alert_mode כדי לא להציף.
+        """
+        if self.mode != self.last_alert_mode:
+            self.last_alert_mode = self.mode
+            if self.mode == "CAUTION":
+                return (
+                    "⚠️ זיהיתי תנאי שוק לא יציבים.\n"
+                    "אני עוצר כניסות אגרסיביות לזמן קצר כדי להימנע מהיפוך פתאומי."
+                )
+            if self.mode == "REVERSAL":
+                return (
+                    "⛔ היפוך מגמה חריף!\n"
+                    "עצרתי כניסות אוטומטיות לחמש דקות (ואאריך אם צריך)."
+                )
+            if self.mode == "NORMAL":
+                return (
+                    "✅ השוק נרגע וחזר להתייצב.\n"
+                    "אני חוזר לפעול כרגיל."
+                )
+        return None
 
 
+# =========================================================
+# AssetConfig - פר נכס
+# =========================================================
+class AssetConfig:
+    def __init__(self):
+        self.chart_mode: str = "CANDLE"  # CANDLE / LINE
+        self.candle_tf_sec: int = 60     # גודל נר
+        self.trade_expiry_sec: int = 60  # זמן עסקה בפוקט
+        self.window_sec: int = 26        # חלון ניתוח
+        self.daily_hits = collections.defaultdict(int)  # הצלחות שדיווחת ידנית
+        self.daily_miss = collections.defaultdict(int)  # כשלונות שדיווחת ידנית
+
+
+# =========================================================
+# BotState - מצב כללי של הבוט
+# =========================================================
 class BotState:
-    """
-    מצב הבוט: באיזה נכס אתה, באיזה מצב (פלאפון/מחשב),
-    ומה האינדקס האחרון ב-LEARNER שמחכה לתוצאה ✅/❌.
-    """
     def __init__(self):
         self.po_asset: str = "EUR/USD"
         self.finnhub_symbol: str = PO_TO_FINNHUB.get(self.po_asset, DEFAULT_SYMBOL)
 
         self.assets: dict[str,AssetConfig] = collections.defaultdict(AssetConfig)
 
-        # PHONE / PC
-        self.session_mode: str = "PHONE"
+        self.session_mode: str = "PHONE"  # PHONE / PC
+        self.last_signal_idx = None       # אינדקס סיגנל שמחכה ל✅/❌
 
-        # אינדקס העסקה האחרונה ב-LEARNER שעדיין בלי ✅/❌
-        self.last_signal_idx = None
-
+        self.guard = MarketGuardState()   # Market safety
 
 APP = BotState()
 AUTO = AutoTrader()
-
 _fetcher_started = False
 
-# ===========================
-# ENV לקריאה
-# ===========================
+
+# =========================================================
+# ENV חובה
+# =========================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_LOCK = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SINGLETON_PORT = int(os.getenv("SINGLETON_PORT", "47653"))
+SINGLETON_PORT = int(os.getenv("SINGLETON_PORT","47653"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)  # parse_mode=None כדי להימנע משגיאות markdown
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)  # בלי Markdown כדי לא להיתקע על parsing
 
 
-# ===========================
-# עזרי מערכת
-# ===========================
+# =========================================================
+# פונקציות מערכת
+# =========================================================
 def aggressive_reset():
     try: bot.remove_webhook()
     except Exception: pass
@@ -88,6 +176,7 @@ def aggressive_reset():
 
 _LOCK = None
 def ensure_single_instance(port: int = SINGLETON_PORT):
+    """מונע כמה מופעים במקביל (Railway וכו')."""
     global _LOCK
     _LOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     _LOCK.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -99,12 +188,14 @@ def ensure_single_instance(port: int = SINGLETON_PORT):
         sys.exit(0)
 
 def ensure_fetcher():
+    """מתחיל למשוך נתוני מחיר (websocket וכו') פעם אחת."""
     global _fetcher_started
     if not _fetcher_started:
         start_fetcher_in_thread(lambda: APP.finnhub_symbol)
         _fetcher_started = True
 
 def allowed(msg) -> bool:
+    """נ鎙ל לשמור שהבוט עונה רק לך אם נתת CHAT_LOCK."""
     return (not CHAT_LOCK) or (str(msg.chat.id) == CHAT_LOCK)
 
 def _today_key() -> str:
@@ -117,8 +208,10 @@ def refresh_symbol():
     APP.finnhub_symbol = PO_TO_FINNHUB.get(APP.po_asset, DEFAULT_SYMBOL)
 
 def _fmt(x, fmt=".4g"):
-    try: return format(float(x), fmt)
-    except Exception: return "n/a"
+    try:
+        return format(float(x), fmt)
+    except Exception:
+        return "n/a"
 
 def _price_decimals(po_asset: str) -> int:
     a = po_asset.upper()
@@ -129,17 +222,17 @@ def _price_decimals(po_asset: str) -> int:
     return 5
 
 
-# ===========================
-# גרף מחיר
-# ===========================
+# =========================================================
+# יצירת גרף מחיר קטן לתמונה
+# =========================================================
 def make_price_png(ticks, window_sec: float, po_asset: str):
     now = time.time()
-    win = [(ts, p) for (ts, p) in list(ticks) if now - ts <= window_sec]
+    win = [(ts, p) for (ts,p) in list(ticks) if now - ts <= window_sec]
     if len(win) < 6:
-        win = list(ticks)[-6:]
+        win = list(ticks)[-6:]  # fallback
 
     buf = io.BytesIO()
-    fig = plt.figure(figsize=(6.6, 3.2))
+    fig = plt.figure(figsize=(6.6,3.2))
     plt.clf()
 
     if not win:
@@ -151,18 +244,16 @@ def make_price_png(ticks, window_sec: float, po_asset: str):
         plt.close(fig)
         return buf.getvalue()
 
-    xs = [ts - win[0][0] for (ts, _) in win]
-    ys = [p for (_, p) in win]
+    xs = [ts - win[0][0] for (ts,_) in win]
+    ys = [p for (_,p) in win]
     last_price = ys[-1]
 
     plt.plot(xs, ys, linewidth=2.0, label="Price")
     plt.axhline(last_price, linestyle="--", linewidth=1.2, label="Last Price")
-
     plt.xlabel("time [sec]")
     dec = _price_decimals(po_asset)
     plt.gca().yaxis.set_major_formatter(FormatStrFormatter(f"%.{dec}f"))
     plt.ylabel("price")
-
     plt.grid(True, linestyle="--", alpha=0.35)
     plt.legend(loc="best", frameon=True)
     plt.title("Last ~window price view")
@@ -172,17 +263,15 @@ def make_price_png(ticks, window_sec: float, po_asset: str):
     return buf.getvalue()
 
 
-# ===========================
-# סנכרון בין חלון ניתוח / זמן עסקה / זמן נר
-# ===========================
-def _nearest_choice(val: int, choices: list[int]) -> int:
-    return min(choices, key=lambda c: abs(c - val))
+# =========================================================
+# סנכרון בין זמן עסקה / TF / חלון ניתוח
+# =========================================================
+def _nearest_choice(val: int, options: list[int]) -> int:
+    return min(options, key=lambda c: abs(c - val))
 
 def sync_from_tf_trade():
     """
-    כשיש לנו TF (candle_tf_sec), זמן עסקה (trade_expiry_sec),
-    אנחנו מחלצים window_sec אוטומטית.
-    ואז דוחפים STRAT_CFG כדי שהאלגוריתם ינתח באותו length.
+    TF (candle_tf_sec) + Expiry -> window_sec והגדרות אסטרטגיה
     """
     cfg = cur_cfg()
     tx = cfg.trade_expiry_sec
@@ -190,7 +279,7 @@ def sync_from_tf_trade():
         tf = cfg.candle_tf_sec
         wnd = max(3*tf, int(0.8*tx))
     else:
-        # מצב LINE - אין TF אמיתי, אז רק חלון ניתוח יחסי לזמן עסקה
+        # LINE: אין TF אמיתי
         wnd = int(0.9*tx)
 
     wnd = max(16, min(wnd, 90))
@@ -201,21 +290,20 @@ def sync_from_tf_trade():
 
 def sync_from_window():
     """
-    אם שינית ידנית את ה-window_sec, אנחנו מעדכנים TF ו-Expiry
-    כדי לשמור אותם אופטימליים לחלון הזה.
+    שינית חלון -> אני מעדכן TF/Expiry אוטומטית
     """
     cfg = cur_cfg()
     w = cfg.window_sec
 
     if cfg.chart_mode == "CANDLE":
         target_tf = max(10, int(round(w/3)))
-        tf_allowed = [sec for _, sec in CANDLE_CHOICES]
+        tf_allowed = [sec for _,sec in CANDLE_CHOICES]
         cfg.candle_tf_sec = _nearest_choice(target_tf, tf_allowed)
         target_tx = int(round(w*1.25))
     else:
         target_tx = int(round(w*1.10))
 
-    tx_allowed = [sec for _, sec in TRADE_CHOICES]
+    tx_allowed = [sec for _,sec in TRADE_CHOICES]
     cfg.trade_expiry_sec = _nearest_choice(target_tx, tx_allowed)
 
     STRAT_CFG["WINDOW_SEC"] = float(cfg.window_sec)
@@ -227,27 +315,27 @@ def sync_from_window():
 
 def recommend_from_expiry(expiry_sec: int):
     """
-    אתה בוחר זמן עסקה -> נחזיר המלצה לזמן נר ולחלון ניתוח.
-    במצב LINE אין TF אז נחזיר רק חלון.
+    בוחר Expiry -> ממליץ TF וחלון.
+    ב-LINE אין TF.
     """
     cfg = cur_cfg()
     if cfg.chart_mode == "LINE":
         wnd = max(16, min(int(0.9*expiry_sec), 90))
         return None, wnd
 
-    tf_allowed = [sec for _, sec in CANDLE_CHOICES]
+    tf_allowed = [sec for _,sec in CANDLE_CHOICES]
     tf_guess = max(10, int(round(expiry_sec/3)))
-    tf = _nearest_choice(tf_guess, tf_allowed)
+    tf_final = _nearest_choice(tf_guess, tf_allowed)
 
-    wnd = max(3*tf, int(0.8*expiry_sec))
+    wnd = max(3*tf_final, int(0.8*expiry_sec))
     wnd = max(16, min(wnd, 90))
 
-    return f"{tf}s", wnd
+    return f"{tf_final}s", wnd
 
 
-# ===========================
-# דירוג איכות והסכמה של טווחי זמן
-# ===========================
+# =========================================================
+# דירוג איכות סיגנל
+# =========================================================
 def quality_label(conf: int, align_bonus: float) -> str:
     if conf >= 75 or align_bonus >= 0.2:
         return "🟩 Strong"
@@ -256,10 +344,6 @@ def quality_label(conf: int, align_bonus: float) -> str:
     return "🟥 Weak"
 
 def multi_timeframe_agree(dbg: dict) -> bool:
-    """
-    dbg אמור לתת לנו side_short / side_mid / side_long מהאסטרטגיה.
-    אנחנו רוצים לראות אם כולן מסכימות על אותו כיוון (UP או DOWN).
-    """
     s_short = dbg.get("side_short")
     s_mid   = dbg.get("side_mid")
     s_long  = dbg.get("side_long")
@@ -268,9 +352,67 @@ def multi_timeframe_agree(dbg: dict) -> bool:
     return (s_short == s_mid == s_long) and s_short in ("UP","DOWN")
 
 
-# ===========================
-# מקלדות (תפריטים)
-# ===========================
+# =========================================================
+# זיהוי מצב שוק -> NORMAL / CAUTION / REVERSAL
+# =========================================================
+def evaluate_market_risk(info: dict) -> str:
+    side       = info["side"]
+    conf       = info["conf"]
+    qual       = info["quality"]
+    agree3     = info["agree3"]
+    slope      = info["trend_slope"]
+    persist    = info["persist"]
+    tick_imb   = info["tick_imb"]
+
+    # אין כיוון מובהק -> רעש
+    if side not in ("UP","DOWN"):
+        return "CAUTION"
+
+    # Strong אבל אין הסכמה בין כל הטווחים -> מתחיל להישבר מבפנים
+    if qual == "🟩 Strong" and not agree3:
+        return "CAUTION"
+
+    # slope ~ 0 אבל conf גבוה => "אני בטוח" בלי תנועה בפועל = חשוד
+    if slope is not None:
+        try:
+            s = float(slope)
+        except:
+            s = 0.0
+        if abs(s) < 0.00001 and conf >= 70:
+            return "CAUTION"
+
+        # כיוון הסיגנל נגד השיפוע החזק = היפוך מגמה
+        if side == "UP" and s < 0 and abs(s) > 0.00005:
+            return "REVERSAL"
+        if side == "DOWN" and s > 0 and abs(s) > 0.00005:
+            return "REVERSAL"
+
+    # persist נמוך מאוד + confidence גבוה => פאזה חדשה/פריצה חדה => מסוכן
+    if persist is not None:
+        try:
+            p = float(persist)
+        except:
+            p = 0.0
+        if p < 0.4 and conf >= 70:
+            return "CAUTION"
+
+    # tick_imb: אם הלחץ הפוך לגמרי, זו שבירה אלימה.
+    if tick_imb is not None:
+        try:
+            ti = float(tick_imb)
+        except:
+            ti = 0.0
+        if side == "UP" and ti < -0.6:
+            return "REVERSAL"
+        if side == "DOWN" and ti > 0.6:
+            return "REVERSAL"
+
+    return "NORMAL"
+
+
+# =========================================================
+# מקלדות טלגרם (תפריט)
+# =========================================================
 def phone_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(types.KeyboardButton("📊 נכס"))
@@ -300,8 +442,7 @@ def current_menu():
 def asset_inline_keyboard(page: int = 0, page_size: int = 6):
     keys = list(PO_TO_FINNHUB.keys())
     start = page * page_size
-    chunk = keys[start:start + page_size]
-
+    chunk = keys[start:start+page_size]
     markup = types.InlineKeyboardMarkup()
     for k in chunk:
         markup.add(types.InlineKeyboardButton(f"🎯 {k}", callback_data=f"asset::{k}::{page}"))
@@ -313,7 +454,6 @@ def asset_inline_keyboard(page: int = 0, page_size: int = 6):
         nav.append(types.InlineKeyboardButton("➡️", callback_data=f"asset_nav::{page+1}"))
     if nav:
         markup.row(*nav)
-
     return markup
 
 def chartmode_keyboard():
@@ -326,36 +466,36 @@ def chartmode_keyboard():
 
 def choices_inline_keyboard(kind: str):
     if kind == "window":
-        markup = types.InlineKeyboardMarkup()
+        m = types.InlineKeyboardMarkup()
         for w in WINDOW_CHOICES:
-            markup.add(types.InlineKeyboardButton(f"{w}s", callback_data=f"set_window::{w}"))
-        markup.add(types.InlineKeyboardButton("חלון ידני…", callback_data="window_manual"))
-        markup.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
-        return markup
+            m.add(types.InlineKeyboardButton(f"{w}s", callback_data=f"set_window::{w}"))
+        m.add(types.InlineKeyboardButton("חלון ידני…", callback_data="window_manual"))
+        m.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
+        return m
 
-    markup = types.InlineKeyboardMarkup()
+    m = types.InlineKeyboardMarkup()
     pairs = TRADE_CHOICES if kind == "trade" else CANDLE_CHOICES
     row=[]
     for label, sec in pairs:
         row.append(types.InlineKeyboardButton(label, callback_data=f"set_{kind}::{sec}"))
         if len(row)==4:
-            markup.row(*row); row=[]
+            m.row(*row); row=[]
     if row:
-        markup.row(*row)
-    markup.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
-    return markup
+        m.row(*row)
+    m.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
+    return m
 
 def manual_window_keyboard():
-    markup = types.InlineKeyboardMarkup()
+    m = types.InlineKeyboardMarkup()
     for w in (10,15,20,25,35,40,50,70,80,100,110):
-        markup.add(types.InlineKeyboardButton(f"{w}s", callback_data=f"set_window::{w}"))
-    markup.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
-    return markup
+        m.add(types.InlineKeyboardButton(f"{w}s", callback_data=f"set_window::{w}"))
+    m.add(types.InlineKeyboardButton("חזרה", callback_data="back_main"))
+    return m
 
 
-# ===========================
-# הודעות עזר
-# ===========================
+# =========================================================
+# עזרי טקסט למשתמש
+# =========================================================
 def print_all(chat_id: int, header: str):
     cfg = cur_cfg()
     lines = [
@@ -380,7 +520,7 @@ def send_instructions(chat_id: int):
             f"2) Chart Mode: Candles ; TF = {cfg.candle_tf_sec}s\n"
             f"3) Trade Expiry = {cfg.trade_expiry_sec}s\n"
             f"4) הבוט מנתח חלון = {cfg.window_sec}s\n"
-            "טיפ: עדיפות ל-Strong 🟩"
+            "טיפ: חפש 🟩 Strong + הסכמה בין כל הטווחים"
         )
     else:
         txt = (
@@ -389,14 +529,14 @@ def send_instructions(chat_id: int):
             "2) Chart Mode: Line (אין TF)\n"
             f"3) Trade Expiry = {cfg.trade_expiry_sec}s\n"
             f"4) חלון ניתוח = {cfg.window_sec}s\n"
-            "טיפ: חפש Strong 🟩"
+            "טיפ: חפש 🟩 Strong + הסכמה בין כל הטווחים"
         )
     bot.send_message(chat_id, txt, reply_markup=current_menu())
 
 
-# ===========================
-# התאמת ספי האוטומציה מהלמידה
-# ===========================
+# =========================================================
+# למידה דינמית -> עדכון ספים לאוטומציה
+# =========================================================
 def adapt_thresholds_from_learning():
     base_enter = AUTO.state.threshold_enter
     base_aggr  = AUTO.state.threshold_aggr
@@ -405,28 +545,17 @@ def adapt_thresholds_from_learning():
     AUTO.set_threshold_aggr(new_aggr)
 
 
-# ===========================
-# הפקת סיגנל אחד מהאלגוריתם
-# ===========================
+# =========================================================
+# ניתוח סיגנל מהאסטרטגיה (strategy.decide_from_ticks)
+# =========================================================
 def get_decision():
-    """
-    שואל את strategy.decide_from_ticks על הנתונים החיים.
-    strategy.decide_from_ticks מחזיר:
-      side ∈ {"UP","DOWN","WAIT"}
-      conf ∈ int אחוז ביטחון
-      dbg ∈ dict עם פיצ'רים (rsi, vol, ema_spread, side_short/mid/long ...)
-
-    פה אנחנו מדרגים איכות, בודקים אם 3 טווחים מסכימים, וכו'.
-    """
     side, conf, dbg = decide_from_ticks(STATE["ticks"])
 
     q = quality_label(conf, float(dbg.get("align_bonus",0.0)))
     agree3 = multi_timeframe_agree(dbg)
-
-    # strong_ok = מצב שבו מותר לשקול כניסה גם על סף אגרסיבי
     strong_ok = (q == "🟩 Strong" and agree3)
 
-    info = {
+    return {
         "side": side,
         "conf": conf,
         "quality": q,
@@ -440,24 +569,25 @@ def get_decision():
         "align_bonus": dbg.get("align_bonus"),
         "strong_ok": strong_ok,
     }
-    return info
 
 
-# ===========================
+# =========================================================
 # HANDLERS
-# ===========================
+# =========================================================
 
 @bot.message_handler(commands=["start"])
 def on_start(msg):
     if not allowed(msg): return
     ensure_fetcher(); aggressive_reset()
 
-    # בכניסה ראשונה נשאל אם אתה בטלפון או במחשב
+    # שואל אם אתה כרגע בפלאפון או מחשב
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("📱 פלאפון", callback_data="mode::PHONE"))
     kb.add(types.InlineKeyboardButton("💻 מחשב", callback_data="mode::PC"))
-    bot.send_message(msg.chat.id,
-        "איפה אתה עכשיו? כך אתאים לך תפריט ויכולות:",
+
+    bot.send_message(
+        msg.chat.id,
+        "איפה אתה עכשיו? (כדי שאתאים לך תפריט ויכולות)",
         reply_markup=kb
     )
 
@@ -467,16 +597,13 @@ def on_mode(msg):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("📱 פלאפון", callback_data="mode::PHONE"))
     kb.add(types.InlineKeyboardButton("💻 מחשב", callback_data="mode::PC"))
-    bot.send_message(msg.chat.id,
-        "בחר מצב עבודה:",
-        reply_markup=kb
-    )
+    bot.send_message(msg.chat.id, "בחר מצב עבודה:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mode::"))
 def on_mode_pick(c):
     if not allowed(c.message): return
     m = c.data.split("::")[1]
-    APP.session_mode = "PC" if m=="PC" else "PHONE"
+    APP.session_mode = "PC" if m == "PC" else "PHONE"
 
     refresh_symbol()
     sync_from_tf_trade()
@@ -491,10 +618,11 @@ def on_instructions(msg):
     send_instructions(msg.chat.id)
 
 
-# ---- בחירת נכס ----
+# ------ נכס ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "📊 נכס")
 def on_asset(msg):
-    bot.send_message(msg.chat.id,
+    bot.send_message(
+        msg.chat.id,
         f"נכס נוכחי: {APP.po_asset}\nבחר נכס:",
         reply_markup=types.ReplyKeyboardRemove()
     )
@@ -530,7 +658,7 @@ def on_asset_pick(c):
     send_instructions(c.message.chat.id)
 
 
-# ---- מצב תרשים ----
+# ------ מצב תרשים ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "📈 מצב תרשים")
 def on_chartmode(msg):
     bot.send_message(msg.chat.id, "בחר מצב תרשים:", reply_markup=chartmode_keyboard())
@@ -547,16 +675,22 @@ def on_chartmode_pick(c):
     send_instructions(c.message.chat.id)
 
 
-# ---- זמן נר ----
+# ------ זמן נר ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🕒 זמן נר")
 def on_candle(msg):
     cfg = cur_cfg()
     if cfg.chart_mode == "LINE":
-        bot.send_message(msg.chat.id,
+        bot.send_message(
+            msg.chat.id,
             "במצב Line אין זמן נר (TF). בחר ⏳ זמן עסקה או 🪟 חלון ניתוח.",
-            reply_markup=current_menu())
+            reply_markup=current_menu()
+        )
         return
-    bot.send_message(msg.chat.id, "בחר זמן נר:", reply_markup=choices_inline_keyboard("candle"))
+    bot.send_message(
+        msg.chat.id,
+        "בחר זמן נר:",
+        reply_markup=choices_inline_keyboard("candle")
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("set_candle::"))
 def on_set_candle(c):
@@ -574,7 +708,7 @@ def on_set_candle(c):
     send_instructions(c.message.chat.id)
 
 
-# ---- זמן עסקה ----
+# ------ זמן עסקה ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "⏳ זמן עסקה")
 def on_trade(msg):
     bot.send_message(msg.chat.id, "בחר זמן עסקה:", reply_markup=choices_inline_keyboard("trade"))
@@ -599,23 +733,27 @@ def on_set_trade(c):
         bot.send_message(
             c.message.chat.id,
             f"התאמה אוטומטית:\nTF מומלץ: {cfg.candle_tf_sec}s\nחלון ניתוח: {rec_w}s",
-            reply_markup=current_menu())
+            reply_markup=current_menu()
+        )
     else:
         bot.send_message(
             c.message.chat.id,
             f"התאמה אוטומטית (Line):\nחלון ניתוח: {rec_w}s (אין TF)",
-            reply_markup=current_menu())
+            reply_markup=current_menu()
+        )
 
     print_all(c.message.chat.id, "זמן העסקה עודכן")
     send_instructions(c.message.chat.id)
 
 
-# ---- חלון ניתוח ----
+# ------ חלון ניתוח ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🪟 חלון ניתוח")
 def on_window(msg):
-    bot.send_message(msg.chat.id,
+    bot.send_message(
+        msg.chat.id,
         "בחר חלון (או 'חלון ידני…'):",
-        reply_markup=choices_inline_keyboard("window"))
+        reply_markup=choices_inline_keyboard("window")
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data == "window_manual")
 def on_window_manual(c):
@@ -632,7 +770,6 @@ def on_set_window(c):
     cfg = cur_cfg()
     sec = int(c.data.split("::")[1])
     cfg.window_sec = max(10, min(sec, 120))
-
     sync_from_window()
 
     bot.answer_callback_query(c.id, text=f"Window={cfg.window_sec}s")
@@ -645,13 +782,29 @@ def on_back_main(c):
     bot.send_message(c.message.chat.id, "תפריט ראשי:", reply_markup=current_menu())
 
 
-# ---- סיגנל / ויזואל / סטטוס / ביצועים ----
+# ------ סיגנל ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🧠 סיגנל")
 def on_signal(msg):
     cfg = cur_cfg()
     info = get_decision()
 
-    # פותח sample חדש אצל ה-LEARNER כדי שנוכל אח"כ לתת ✅/❌
+    # 1. עדכון MarketGuard
+    risk_mode = evaluate_market_risk(info)
+    if risk_mode in ("CAUTION","REVERSAL"):
+        changed = APP.guard.set_mode(risk_mode, extend=True)
+    else:
+        # רק אם אין קירור פעיל נחזור ל-NORMAL
+        if not APP.guard.cooldown_active():
+            changed = APP.guard.set_mode("NORMAL")
+        else:
+            changed = False
+
+    # נשלח התראת שינוי מצב אם צריך
+    note = APP.guard.should_notify_change()
+    if note:
+        bot.send_message(msg.chat.id, note, reply_markup=current_menu())
+
+    # 2. רישום הדגימה ללמידה
     if info["side"] in ("UP","DOWN"):
         APP.last_signal_idx = LEARNER.new_sample(
             asset=APP.po_asset,
@@ -668,25 +821,38 @@ def on_signal(msg):
     else:
         APP.last_signal_idx = None
 
-    # אם אנחנו במחשב ויש אוטומציה דולקת - תנסה להיכנס
+    # 3. מסחר אוטומטי (PC בלבד)
     auto_line = ""
     if APP.session_mode == "PC":
         traded = False
         if info["side"] in ("UP","DOWN"):
-            # נעדכן ספים לפי מה שלמדנו עד עכשיו מגיטהב
-            adapt_thresholds_from_learning()
-            traded = AUTO.place_if_allowed(
-                side=info["side"],
-                conf=info["conf"],
-                strong_ok=info["strong_ok"]
-            )
+            # מותר להכנס אוטומטית רק אם אין קירור פעיל ואנחנו ב-NORMAL
+            if not APP.guard.cooldown_active() and APP.guard.mode == "NORMAL":
+                adapt_thresholds_from_learning()
+                traded = AUTO.place_if_allowed(
+                    side=info["side"],
+                    conf=info["conf"],
+                    strong_ok=info["strong_ok"]
+                )
+            else:
+                traded = False
 
-        if traded:
+        if APP.guard.cooldown_active():
+            auto_line = f"💻 AutoTrade: PAUSED ({APP.guard.mode})"
+        elif traded:
             auto_line = "💻 AutoTrade: נכנס " + ("↑" if info["side"]=="UP" else "↓")
         else:
             auto_line = f"💻 AutoTrade: {AUTO.state.last_action or 'לא נכנס'}"
 
-    arrow = "🔼" if info["side"] == "UP" else "🔽" if info["side"] == "DOWN" else "⏳"
+    # 4. אזהרת זהירות במסחר ידני
+    warning_line = ""
+    if APP.session_mode == "PHONE":
+        if APP.guard.mode == "CAUTION":
+            warning_line = "⚠️ שינוי מגמה/רעש. זהירות בכניסה."
+        elif APP.guard.mode == "REVERSAL":
+            warning_line = "⛔ היפוך מגמה חשוד! עדיף להמתין."
+
+    arrow = "🔼" if info["side"]=="UP" else "🔽" if info["side"]=="DOWN" else "⏳"
 
     lines = [
         "סיגנל",
@@ -703,23 +869,33 @@ def on_signal(msg):
         f"RSI: {_fmt(info['rsi'],'.1f')} | Vol: {_fmt(info['vol'],'.2e')}",
         f"ema_spread: {_fmt(info['ema_spread'])} | slope: {_fmt(info['trend_slope'])}",
         f"persist: {_fmt(info['persist'],'.2f')} | tick_imb: {_fmt(info['tick_imb'],'.2f')} | align_bonus: {_fmt(info['align_bonus'],'.2f')}",
+        APP.guard.status_line(),
     ]
 
+    if warning_line:
+        lines.append(warning_line)
     if APP.session_mode == "PC":
         lines.append(auto_line)
 
     png = make_price_png(STATE["ticks"], cfg.window_sec, APP.po_asset)
-    bot.send_photo(msg.chat.id, png, caption="\n".join(lines), reply_markup=current_menu())
+    bot.send_photo(
+        msg.chat.id,
+        png,
+        caption="\n".join(lines),
+        reply_markup=current_menu()
+    )
 
 
+# ------ ויזואל ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🖼️ ויזואל")
 def on_visual(msg):
     cfg = cur_cfg()
     png = make_price_png(STATE["ticks"], cfg.window_sec, APP.po_asset)
-    cap = "גרף מחיר בחלון האחרון (X=sec, Y=price). הקו המקווקו הוא המחיר הנוכחי."
+    cap = "גרף מחיר אחרון (X שניות, Y מחיר). הקו המקווקו = המחיר הנוכחי."
     bot.send_photo(msg.chat.id, png, caption=cap, reply_markup=current_menu())
 
 
+# ------ סטטוס ------
 def status_header() -> list[str]:
     src = 'LIVE (Finnhub)' if HAS_LIVE_KEY else 'MISSING_API_KEY'
     return [
@@ -753,6 +929,8 @@ def on_status(msg):
         f"Trade Expiry: {cfg.trade_expiry_sec}s",
         f"Analysis Window: {cfg.window_sec}s",
         f"Window ticks: {n_win}/{n_total}",
+        "",
+        "איתות נוכחי",
         f"Signal: {info['side']}",
         f"Confidence: {info['conf']}%",
         f"Quality: {info['quality']}",
@@ -763,6 +941,10 @@ def on_status(msg):
         f"Persistence: {_fmt(info['persist'],'.2f')}",
         f"Tick imbalance: {_fmt(info['tick_imb'],'.2f')}",
         f"Align bonus: {_fmt(info['align_bonus'],'.2f')}",
+        "",
+        "Market Guard",
+        APP.guard.status_line(),
+        f"Cooldown active: {'YES' if APP.guard.cooldown_active() else 'NO'}",
         "",
         "למידה חיה",
         f"Strong win%: {learn_summary['Strong win%']}",
@@ -781,6 +963,7 @@ def on_status(msg):
     bot.send_message(msg.chat.id, "\n".join(lines), reply_markup=current_menu())
 
 
+# ------ ביצועים ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "📈 ביצועים")
 def on_performance(msg):
     cfg = cur_cfg()
@@ -801,7 +984,7 @@ def on_performance(msg):
     bot.send_message(msg.chat.id, "\n".join(lines), reply_markup=current_menu())
 
 
-# ---- פגיעה / החטאה ----
+# ------ פגיעה / החטאה ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text in ["✅ פגיעה","❌ החטאה"])
 def on_result(msg):
     cfg = cur_cfg()
@@ -813,11 +996,10 @@ def on_result(msg):
     else:
         cfg.daily_miss[day] += 1
 
-    # עדכן LEARNER (נשמר בגיטהב)
     idx = APP.last_signal_idx
     if idx is not None:
         LEARNER.mark_result(idx, success)
-        APP.last_signal_idx = None  # נסגר
+        APP.last_signal_idx = None
 
     bot.send_message(
         msg.chat.id,
@@ -826,20 +1008,18 @@ def on_result(msg):
     )
 
 
-# ---- מסחר אוטומטי ----
+# ------ שליטה באוטומציה ------
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "🤖 מסחר אוטומטי")
 def on_auto_toggle(msg):
     if APP.session_mode != "PC":
         bot.send_message(msg.chat.id, "זמין רק במצב מחשב 💻.", reply_markup=current_menu())
         return
-
     if AUTO.state.enabled:
         AUTO.disable()
         bot.send_message(msg.chat.id, "Auto-Trading: OFF", reply_markup=current_menu())
     else:
         AUTO.enable()
         bot.send_message(msg.chat.id, "Auto-Trading: ON", reply_markup=current_menu())
-
 
 @bot.message_handler(func=lambda m: allowed(m) and m.text == "⚙️ Auto-Settings")
 def on_auto_settings(msg):
@@ -861,9 +1041,7 @@ def on_auto_settings(msg):
         types.InlineKeyboardButton("Interval +5s", callback_data="auto::ival:+5"),
     )
     kb.add(types.InlineKeyboardButton("סטטוס אוטו", callback_data="auto::status"))
-
     bot.send_message(msg.chat.id, "הגדרות אוטומציה:", reply_markup=kb)
-
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto::"))
 def on_auto_cb(c):
@@ -898,26 +1076,58 @@ def on_auto_cb(c):
     )
 
 
-# ---- לולאת אוטומציה ברקע (PC בלבד) ----
+# =========================================================
+# לולאת אוטומציה ברקע (למצב PC)
+# הבוט ימשיך לנתח ברקע ולבצע עסקאות אוטומטיות
+# אבל יכבד את MarketGuard (cooldown אחרי REVERSAL וכו')
+# =========================================================
 def auto_loop():
     while True:
         try:
             if APP.session_mode == "PC" and AUTO.state.enabled:
                 info = get_decision()
-                if info["side"] in ("UP","DOWN"):
+
+                # עדכון guard
+                risk_mode = evaluate_market_risk(info)
+                if risk_mode in ("CAUTION","REVERSAL"):
+                    changed = APP.guard.set_mode(risk_mode, extend=True)
+                else:
+                    if not APP.guard.cooldown_active():
+                        changed = APP.guard.set_mode("NORMAL")
+                    else:
+                        changed = False
+
+                # אם מצב guard השתנה -> שלח התראה שקטה אל בעל החשבון
+                note = APP.guard.should_notify_change()
+                if note and CHAT_LOCK:
+                    try:
+                        bot.send_message(CHAT_LOCK, note, reply_markup=current_menu())
+                    except Exception:
+                        pass
+
+                # כניסה אוטומטית בפועל?
+                if (
+                    info["side"] in ("UP","DOWN")
+                    and not APP.guard.cooldown_active()
+                    and APP.guard.mode == "NORMAL"
+                ):
                     adapt_thresholds_from_learning()
                     AUTO.place_if_allowed(
                         side=info["side"],
                         conf=info["conf"],
                         strong_ok=info["strong_ok"]
                     )
+
             time.sleep(2.0)
+
         except Exception as e:
             print("[AUTO LOOP] exception:", e)
             time.sleep(2.0)
 
 
-# ---- PANIC ----
+# =========================================================
+# PANIC
+# =========================================================
 @bot.message_handler(commands=["panic"])
 def on_panic(msg):
     if not allowed(msg): return
@@ -929,7 +1139,9 @@ def on_panic(msg):
     sys.exit(0)
 
 
-# ---- RUN ----
+# =========================================================
+# ריצה
+# =========================================================
 def run_forever():
     while True:
         try:
@@ -937,7 +1149,7 @@ def run_forever():
             print("Bot started polling…")
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
         except ApiTelegramException as e:
-            code = getattr(e, "result_json", {}).get("error_code", None) if hasattr(e, "result_json") else None
+            code = getattr(e, "result_json", {}).get("error_code", None) if hasattr(e,"result_json") else None
             if code == 409:
                 print("[409] cleaning webhook & retry")
                 aggressive_reset()
@@ -951,7 +1163,7 @@ def run_forever():
 def main():
     ensure_single_instance()
     ensure_fetcher()
-    sync_from_tf_trade()  # סנכרון התחלתי
+    sync_from_tf_trade()
     t = threading.Thread(target=auto_loop, daemon=True)
     t.start()
     run_forever()
