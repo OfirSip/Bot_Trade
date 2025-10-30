@@ -43,7 +43,7 @@ async def _consumer(sym: str):
                     STATE["used_symbol"] = sym
                     with STATE["lock"]:
                         STATE["ticks"].append((time.time(), price))
-                        
+
 async def _main_loop(sym_getter):
     if not HAS_LIVE_KEY:
         STATE["ws_online"] = False
