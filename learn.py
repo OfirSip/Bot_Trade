@@ -1,310 +1,388 @@
 # learn.py
 from __future__ import annotations
-import time, json, os, base64, requests
-from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Literal, Optional
+import os, json, time, base64, threading, requests
+from typing import Optional, Dict, Any, List
 
-Side = Literal["UP", "DOWN"]
-
-# === CONFIG FROM ENV ===
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
-GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()  # e.g. "Ofirsi/pocket-bot"
-GITHUB_LEARNER_PATH = os.getenv("GITHUB_LEARNER_PATH", "learner_data.json").strip()
-
-GITHUB_API_BASE = "https://api.github.com"
-
-
-@dataclass
-class TradeSample:
-    ts: float
-    asset: str
-    side: Side
-    conf: int
-    quality: str
-    agree3: bool
-    rsi: float
-    ema_spread: float
-    persist: float
-    tick_imb: float
-    align_bonus: float
-    result: Optional[bool] = None  # True=✅, False=❌, None=עדיין אין פידבק
+###############################################################################
+# מבוא
+# -----
+# LEARNER אוסף דגימות (סיגנלים), מקבל ממך פידבק ✅/❌,
+# מחשב סטטיסטיקות הצלחה לפי איכות (Strong/Medium/Weak, וגם לפי "Agree3TF"),
+# ומפיק thresholds חדשים למסחר אוטומטי.
+#
+# שדרוג עכשיו:
+# - זיכרון מתמשך בין ריצות דרך GitHub.
+#   הבוט טוען היסטוריה בתחילה ושומר חזרה אחרי כל עדכון תוצאה.
+###############################################################################
 
 
-@dataclass
-class LiveStats:
-    quality_hits: Dict[str,int] = field(default_factory=lambda: {
-        "🟩 Strong":0,
-        "🟨 Medium":0,
-        "🟥 Weak":0
-    })
-    quality_miss: Dict[str,int] = field(default_factory=lambda: {
-        "🟩 Strong":0,
-        "🟨 Medium":0,
-        "🟥 Weak":0
-    })
-    agree3_hits: int = 0
-    agree3_miss: int = 0
+# ============================================================
+# ENV
+# ============================================================
 
-    def record(self, sample: TradeSample):
-        if sample.result is None:
-            return
-        q = sample.quality
-        hit = 1 if sample.result else 0
-        miss = 1 - hit
+GITHUB_TOKEN          = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_REPO           = os.getenv("GITHUB_REPO", "").strip()            # "username/reponame"
+GITHUB_LEARNER_PATH   = os.getenv("GITHUB_LEARNER_PATH", "learner_data.json").strip()
 
-        if q not in self.quality_hits:
-            self.quality_hits[q] = 0
-            self.quality_miss[q] = 0
-
-        self.quality_hits[q] += hit
-        self.quality_miss[q] += miss
-
-        if sample.agree3:
-            self.agree3_hits += hit
-            self.agree3_miss += miss
-
-    def winrate_quality(self, q: str) -> float:
-        h = self.quality_hits.get(q,0)
-        m = self.quality_miss.get(q,0)
-        tot = h+m
-        return (100.0*h/tot) if tot>0 else 0.0
-
-    def winrate_agree3(self) -> float:
-        tot = self.agree3_hits + self.agree3_miss
-        return (100.0*self.agree3_hits/tot) if tot>0 else 0.0
+# לדוגמה:
+# GITHUB_TOKEN=ghp_abc123...
+# GITHUB_REPO="Ofirsi/po-bot"
+# GITHUB_LEARNER_PATH="learner_data.json"
 
 
-class Learner:
+# ============================================================
+# Helper: GitHub storage
+# ============================================================
+
+def _github_headers():
+    if not GITHUB_TOKEN:
+        return None
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "PocketOptionLearnerBot"
+    }
+
+def github_load_file() -> Optional[Dict[str, Any]]:
     """
-    שומר ומטען learner_data.json ישר מה-Repo שלך בגיטהב.
-    בכל פעם שאתה מקבל סיגנל / מסמן פגיעה או החטאה,
-    אנחנו שולחים commit חדש עם עדכון הקובץ.
+    מוריד את הקובץ JSON מהריפו (אם קיים) ומחזיר dict.
+    אם אין הרשאות או אין קובץ -> מחזיר None.
+    """
+    if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_LEARNER_PATH):
+        return None
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_LEARNER_PATH}"
+    headers = _github_headers()
+    if headers is None:
+        return None
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # GitHub מחזיק את התוכן ב-base64
+            b64 = data.get("content", "")
+            raw = base64.b64decode(b64).decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        else:
+            # file not found or no access
+            return None
+    except Exception:
+        return None
+
+def github_save_file(payload: Dict[str, Any]) -> bool:
+    """
+    שומר את ה-data לריפו בנתיב GITHUB_LEARNER_PATH.
+    אם הקובץ כבר קיים -> צריך להביא גם את ה-SHA כדי לעדכן (PUT).
+    אם אין קובץ -> ניצור חדש.
+    מחזיר True אם הצליח.
+    """
+    if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_LEARNER_PATH):
+        return False
+
+    headers = _github_headers()
+    if headers is None:
+        return False
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_LEARNER_PATH}"
+
+    # לפני שאנחנו שומרים, נבדוק אם הקובץ כבר קיים כדי להשיג sha
+    sha = None
+    try:
+        info = requests.get(url, headers=headers, timeout=10)
+        if info.status_code == 200:
+            sha = info.json().get("sha")
+    except Exception:
+        pass
+
+    body_str = json.dumps(payload, ensure_ascii=False, indent=2)
+    b64_body = base64.b64encode(body_str.encode("utf-8")).decode("ascii")
+
+    put_payload = {
+        "message": f"update learner_data {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "content": b64_body,
+        "branch": "main",   # אם הריפו שלך לא על main אלא על master תשנה פה
+    }
+    if sha is not None:
+        put_payload["sha"] = sha
+
+    try:
+        r = requests.put(url, headers=headers, json=put_payload, timeout=10)
+        return (200 <= r.status_code < 300)
+    except Exception:
+        return False
+
+
+# ============================================================
+# Learner State
+# ============================================================
+
+class LearnerState:
+    """
+    אנחנו מחזיקים:
+    - samples: רשימת דגימות (סיגנלים) שקרו.
+      כל איבר:
+        {
+          "ts": timestamp,
+          "asset": "EUR/USD",
+          "side": "UP"/"DOWN",
+          "conf": 73,
+          "quality": "🟩 Strong" / "🟨 Medium" / "🟥 Weak",
+          "agree3": True/False,
+          "rsi": float,
+          "ema_spread": float,
+          "persist": float,
+          "tick_imb": float,
+          "align_bonus": float,
+          "result": None/True/False
+        }
+
+    - stats_by_quality: נסיק מתוך samples את האחוזי פגיעה לפי איכות
+    - stats_agree3: כמה אחוז הצלחה כשיש הסכמה בכל הטיימפריימים
+    - thresholds למסחר אוטומטי:
+        threshold_enter  (כמה ביטחון צריך כדי להיכנס בכלל)
+        threshold_aggr   (כמה ביטחון כדי להיכנס באגרסיביות)
     """
 
     def __init__(self):
-        self.samples: List[TradeSample] = []
-        self.live = LiveStats()
-        self._loaded = False
-        self._remote_sha: Optional[str] = None  # GitHub file SHA (בשביל עדכון קיים)
+        self.lock = threading.Lock()
 
-    # ----- Github helpers -----
+        self.samples: List[Dict[str, Any]] = []
+        # ערכי ברירת מחדל אם אין דאטה עדיין:
+        self.threshold_enter: int = 70
+        self.threshold_aggr:  int = 80
 
-    def _headers(self):
-        if not GITHUB_TOKEN:
-            raise RuntimeError("Missing GITHUB_TOKEN env")
-        return {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json"
-        }
+    # ---------- Persistence to/from GitHub ----------
 
-    def _content_url(self) -> str:
-        if not GITHUB_REPO:
-            raise RuntimeError("Missing GITHUB_REPO env")
-        return f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{GITHUB_LEARNER_PATH}"
-
-    def _pull_from_github(self):
-        """טוען learner_data.json מהריפו. אם אין שם קובץ - מתחילים ריק."""
-        try:
-            r = requests.get(self._content_url(), headers=self._headers(), timeout=10)
-        except Exception as e:
-            print(f"[LEARNER] pull error: {e}")
+    def load_from_github(self):
+        """
+        נקרא פעם אחת כשהבוט עולה.
+        מנסה למשוך היסטוריה קיימת מהריפו.
+        """
+        data = github_load_file()
+        if not data:
             return
 
-        if r.status_code == 404:
-            print("[LEARNER] no remote learner_data yet, starting fresh")
-            return
+        with self.lock:
+            # samples
+            incoming_samples = data.get("samples", [])
+            if isinstance(incoming_samples, list):
+                self.samples = incoming_samples
 
-        if r.status_code != 200:
-            print(f"[LEARNER] pull status {r.status_code}: {r.text}")
-            return
+            # thresholds
+            th_enter = data.get("threshold_enter")
+            th_aggr  = data.get("threshold_aggr")
+            if isinstance(th_enter, (int,float)):
+                self.threshold_enter = int(th_enter)
+            if isinstance(th_aggr, (int,float)):
+                self.threshold_aggr  = int(th_aggr)
 
-        data = r.json()
-        self._remote_sha = data.get("sha")
+    def save_to_github(self):
+        """
+        שומר snapshot עדכני לריפו (async-safe בתוך lock).
+        נקרא אחרי עדכון תוצאה או כשמשנים thresholds.
+        """
+        if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_LEARNER_PATH):
+            return  # אין קונפיג, אז לא ננסה בכלל
 
-        encoded = data.get("content", "")
-        if data.get("encoding") != "base64":
-            print("[LEARNER] unexpected encoding")
-            return
-
-        try:
-            decoded_bytes = base64.b64decode(encoded)
-            payload = json.loads(decoded_bytes.decode("utf-8"))
-        except Exception as e:
-            print(f"[LEARNER] decode error: {e}")
-            return
-
-        # samples מהעבר
-        raw_samples = payload.get("samples", [])
-        for item in raw_samples:
-            try:
-                self.samples.append(TradeSample(
-                    ts=item["ts"],
-                    asset=item["asset"],
-                    side=item["side"],
-                    conf=item["conf"],
-                    quality=item["quality"],
-                    agree3=item["agree3"],
-                    rsi=item["rsi"],
-                    ema_spread=item["ema_spread"],
-                    persist=item["persist"],
-                    tick_imb=item["tick_imb"],
-                    align_bonus=item["align_bonus"],
-                    result=item.get("result", None),
-                ))
-            except KeyError:
-                # אם חסר שדה בקובץ ישן, נדלג על הדגימה
-                continue
-
-        # live stats
-        raw_live = payload.get("live", {})
-        self.live.quality_hits.update(raw_live.get("quality_hits", {}))
-        self.live.quality_miss.update(raw_live.get("quality_miss", {}))
-        self.live.agree3_hits  = raw_live.get("agree3_hits",  self.live.agree3_hits)
-        self.live.agree3_miss  = raw_live.get("agree3_miss",  self.live.agree3_miss)
-
-    def _push_to_github(self, message: str):
-        """כותב את המצב המעודכן לריפו (commit חדש)."""
-        if not GITHUB_TOKEN or not GITHUB_REPO:
-            print("[LEARNER] skip push (missing GitHub env)")
-            return
-
-        body = {
-            "samples": [asdict(s) for s in self.samples],
-            "live": {
-                "quality_hits": self.live.quality_hits,
-                "quality_miss": self.live.quality_miss,
-                "agree3_hits": self.live.agree3_hits,
-                "agree3_miss": self.live.agree3_miss,
+        with self.lock:
+            payload = {
+                "samples": self.samples,
+                "threshold_enter": self.threshold_enter,
+                "threshold_aggr": self.threshold_aggr,
+                "last_update_ts": time.time(),
             }
+        github_save_file(payload)
+
+    # ---------- Recording new samples ----------
+
+    def new_sample(
+        self,
+        asset: str,
+        side: str,
+        conf: int,
+        quality: str,
+        agree3: bool,
+        rsi: float,
+        ema_spread: float,
+        persist: float,
+        tick_imb: float,
+        align_bonus: float
+    ) -> int:
+        """
+        מוסיף סיגנל חדש (לפני שאתה יודע אם הצליח או לא).
+        מחזיר אינדקס שלו כדי שנוכל לעדכן תוצאה אחר כך.
+        """
+        sample = {
+            "ts": time.time(),
+            "asset": asset,
+            "side": side,
+            "conf": conf,
+            "quality": quality,
+            "agree3": bool(agree3),
+            "rsi": rsi,
+            "ema_spread": ema_spread,
+            "persist": persist,
+            "tick_imb": tick_imb,
+            "align_bonus": align_bonus,
+            "result": None,  # יתעדכן ל-True/False אחרי שתדווח ✅/❌
         }
 
-        encoded_content = base64.b64encode(
-            json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("utf-8")
+        with self.lock:
+            self.samples.append(sample)
+            idx = len(self.samples) - 1
 
-        payload = {
-            "message": message,
-            "content": encoded_content,
-        }
-        if self._remote_sha:
-            payload["sha"] = self._remote_sha
-
-        try:
-            r = requests.put(self._content_url(), headers=self._headers(), json=payload, timeout=10)
-        except Exception as e:
-            print(f"[LEARNER] push error: {e}")
-            return
-
-        if r.status_code not in (200,201):
-            print(f"[LEARNER] push status {r.status_code}: {r.text}")
-            return
-
-        resp = r.json()
-        self._remote_sha = resp.get("content", {}).get("sha", self._remote_sha)
-
-    # ----- Persistence lifecycle -----
-
-    def load_if_needed(self):
-        if self._loaded:
-            return
-        self._loaded = True
-        self._pull_from_github()
-
-    def save_now(self, message: str):
-        self._push_to_github(message)
-
-    # ----- API שקורא main.py -----
-
-    def new_sample(self,
-                   asset: str,
-                   side: Side,
-                   conf: int,
-                   quality: str,
-                   agree3: bool,
-                   rsi: float,
-                   ema_spread: float,
-                   persist: float,
-                   tick_imb: float,
-                   align_bonus: float) -> int:
-        """
-        נוצר סיגנל / כניסה אפשרית. עדיין לא ידוע אם הצליח.
-        נשמר גם בגיטהב.
-        """
-        self.load_if_needed()
-        s = TradeSample(
-            ts=time.time(),
-            asset=asset,
-            side=side,
-            conf=conf,
-            quality=quality,
-            agree3=agree3,
-            rsi=rsi,
-            ema_spread=ema_spread,
-            persist=persist,
-            tick_imb=tick_imb,
-            align_bonus=align_bonus,
-            result=None
-        )
-        self.samples.append(s)
-        idx = len(self.samples)-1
-        self.save_now(message="add new sample")
         return idx
 
     def mark_result(self, idx: int, success: bool):
         """
-        אחרי פקיעה אתה לוחץ ✅ או ❌.
-        פה נסגור את העסקה, נעדכן סטטיסטיקה, ונשמור לגיטהב.
+        משתמש לוחץ '✅ פגיעה' או '❌ החטאה'.
+        זה קובע אם הסיגנל האחרון עבד בפועל.
+        ואז נשמור לגיטהאב.
         """
-        self.load_if_needed()
-        if idx < 0 or idx >= len(self.samples):
-            return
-        self.samples[idx].result = success
-        self.live.record(self.samples[idx])
-        self.save_now(message="update sample result")
+        with self.lock:
+            if 0 <= idx < len(self.samples):
+                self.samples[idx]["result"] = bool(success)
 
-    def last_open_index(self) -> Optional[int]:
+        # נשמור snapshot מעודכן
+        self.save_to_github()
+
+    # ---------- Stats / summary ----------
+
+    def _collect_stats(self):
         """
-        אם מסיבה כלשהי פספסת ✅/❌ לעסקה קודמת, זה עוזר למצוא אותה.
-        כרגע לא משתמשים בזה חיצונית, אבל נשאיר.
+        מחשב אחוזי פגיעה לפי quality ו-agree3.
         """
-        self.load_if_needed()
-        for i in range(len(self.samples)-1, -1, -1):
-            if self.samples[i].result is None:
-                return i
-        return None
+        with self.lock:
+            data = list(self.samples)
+
+        # לפי איכות
+        buckets = {
+            "🟩 Strong": {"hit":0,"tot":0},
+            "🟨 Medium": {"hit":0,"tot":0},
+            "🟥 Weak":   {"hit":0,"tot":0},
+        }
+        # לפי agree3
+        agree3_stats = {"hit":0,"tot":0}
+
+        for s in data:
+            res = s.get("result", None)
+            qual = s.get("quality","?")
+            agr  = bool(s.get("agree3", False))
+
+            if qual in buckets and res is not None:
+                buckets[qual]["tot"] += 1
+                if res:
+                    buckets[qual]["hit"] += 1
+
+            if agr and res is not None:
+                agree3_stats["tot"] += 1
+                if res:
+                    agree3_stats["hit"] += 1
+
+        def pct(h,t):
+            return (100.0*h/t) if t>0 else 0.0
+
+        strong_wr = pct(buckets["🟩 Strong"]["hit"], buckets["🟩 Strong"]["tot"])
+        med_wr    = pct(buckets["🟨 Medium"]["hit"], buckets["🟨 Medium"]["tot"])
+        weak_wr   = pct(buckets["🟥 Weak"]["hit"],   buckets["🟥 Weak"]["tot"])
+        agree_wr  = pct(agree3_stats["hit"], agree3_stats["tot"])
+
+        return {
+            "Strong win%": f"{strong_wr:.1f}%",
+            "Medium win%": f"{med_wr:.1f}%",
+            "Weak win%": f"{weak_wr:.1f}%",
+            "Agree3 win%": f"{agree_wr:.1f}%",
+            "raw": {
+                "strong": buckets["🟩 Strong"],
+                "medium": buckets["🟨 Medium"],
+                "weak":   buckets["🟥 Weak"],
+                "agree3": agree3_stats,
+            }
+        }
 
     def summarize(self) -> Dict[str,str]:
         """
-        זה מה שהבוט מדפיס לך בסטטוס (win rates).
+        משמש את הפקודה '🛰️ סטטוס' כדי להראות לך את אחוזי הפגיעה האמיתיים עד עכשיו.
         """
-        self.load_if_needed()
+        stats = self._collect_stats()
         return {
-            "Strong win%": f"{self.live.winrate_quality('🟩 Strong'):.1f}%",
-            "Medium win%": f"{self.live.winrate_quality('🟨 Medium'):.1f}%",
-            "Weak win%": f"{self.live.winrate_quality('🟥 Weak'):.1f}%",
-            "Agree3 win%": f"{self.live.winrate_agree3():.1f}%",
+            "Strong win%": stats["Strong win%"],
+            "Medium win%": stats["Medium win%"],
+            "Weak win%": stats["Weak win%"],
+            "Agree3 win%": stats["Agree3 win%"],
         }
 
-    def dynamic_thresholds(self, base_enter: int, base_aggr: int):
-        """
-        מתאים ספי כניסה למסחר האוטומטי לפי ביצועים היסטוריים.
-        אם Strong אצלך באמת מרוויח הרבה → נוריד קצת את הרף.
-        אם Medium חלש → נעלה את הסף האגרסיבי.
-        """
-        self.load_if_needed()
+    # ---------- Dynamic thresholds ----------
 
-        strong_wr = self.live.winrate_quality("🟩 Strong")
+    def dynamic_thresholds(self, base_enter: int, base_aggr: int) -> (int,int):
+        """
+        משתמשים בהיסטוריה שלך כדי לעדכן ספים למסחר אוטומטי.
+        רעיון:
+        - אם Strong ניצחונות גבוהים → אולי אפשר להוריד קצת threshold_enter
+        - אם Strong גרוע לאחרונה → להעלות threshold_enter
+        - אם Agree3 חזק בטירוף → אפשר להיות אגרסיבי יותר
+        """
+        stats = self._collect_stats()
+        raw = stats["raw"]
+
+        strong_tot = raw["strong"]["tot"]
+        strong_hit = raw["strong"]["hit"]
+        strong_wr  = (100.0*strong_hit/strong_tot) if strong_tot>0 else None
+
+        agree_tot = raw["agree3"]["tot"]
+        agree_hit = raw["agree3"]["hit"]
+        agree_wr  = (100.0*agree_hit/agree_tot) if agree_tot>0 else None
+
         new_enter = base_enter
-        if strong_wr > 70.0 and base_enter > 60:
-            new_enter = max(60, base_enter - 3)
+        new_aggr  = base_aggr
 
-        medium_wr = self.live.winrate_quality("🟨 Medium")
-        new_aggr = base_aggr
-        if medium_wr < 50.0 and base_aggr < new_enter:
-            new_aggr = new_enter
+        # אם ה"Strong" שלך באמת חזק >60% הצלחה => אפשר טיפה להקל
+        if strong_wr is not None:
+            if strong_wr >= 65.0:
+                new_enter = max(50, base_enter - 3)
+            elif strong_wr < 50.0:
+                new_enter = min(90, base_enter + 5)
+
+        # אם יש הסכמה בין כל הטיימפריימים והיא מצליחה מאוד,
+        # אפשר להיות יותר אגרסיביים כשהביטחון גבוה.
+        if agree_wr is not None:
+            if agree_wr >= 70.0:
+                new_aggr = max(60, base_aggr - 5)
+            elif agree_wr < 50.0:
+                new_aggr = min(95, base_aggr + 5)
+
+        # נשמור את הספים החדשים פנימית (כדי שגם יישמרו ל-GitHub)
+        with self.lock:
+            self.threshold_enter = new_enter
+            self.threshold_aggr  = new_aggr
+
+        # וגם נשמור החוצה כדי שהמידע הזה ישרוד ריסטארט
+        self.save_to_github()
 
         return new_enter, new_aggr
 
 
-# אובייקט גלובלי שמשתמשים בו ב-main
-LEARNER = Learner()
+# ============================================================
+# אינסטנס הגלובלי שהקוד הראשי משתמש בו
+# ============================================================
+LEARNER = LearnerState()
+
+
+# ============================================================
+# פונקציה לעדכן את ה-LEARNER בתחילת הבוט
+# (תקרא לזה מ-main.py בהפעלה)
+# ============================================================
+def init_learner_from_remote():
+    """
+    לקרוא בתחילת main():
+      from learn import init_learner_from_remote
+      init_learner_from_remote()
+
+    זה יטען היסטוריה קיימת מ-GitHub (אם יש הרשאות ו/או אם הקובץ קיים),
+    ואז ה־LEARNER ירוץ כבר עם ניסיון עבר.
+    """
+    LEARNER.load_from_github()
