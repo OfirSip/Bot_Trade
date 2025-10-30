@@ -10,7 +10,7 @@ from pocket_map import PO_TO_FINNHUB, DEFAULT_SYMBOL
 from strategy import decide_from_ticks, CFG as STRAT_CFG
 from auto_trader import AutoTrader
 from learn import LEARNER
-
+from learn import init_learner_from_remote
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
