@@ -1,192 +1,234 @@
 # auto_trader.py
 from __future__ import annotations
-import time, threading
-from dataclasses import dataclass
-from typing import Optional, Literal
+import os, time, traceback
+from dataclasses import dataclass, field
+from typing import Optional
 
-Side = Literal["UP", "DOWN"]
+# Selenium / Chrome DevTools connection
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 
-# ננסה לייבא Selenium. אם אין - DRY mode.
-SELENIUM_OK = True
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.common.exceptions import NoSuchElementException, WebDriverException
-except Exception:
-    SELENIUM_OK = False
-    webdriver = By = NoSuchElementException = WebDriverException = object  # type: ignore
 
-# כתובת החיבור ל-Chrome שהרצת עם --remote-debugging-port=9222
-DEBUG_HOST = "127.0.0.1"
-DEBUG_PORT = 9222
+# =====================================================================================
+# קונפיג מהסביבה
+# =====================================================================================
 
-# ה-XPaths לכפתורי BUY ו-SELL שהבאת
-XPATH_UP   = "//div[contains(@class,'action-high-low') and contains(@class,'button-call-wrap')]//a[contains(@class,'btn-call')]"
-XPATH_DOWN = "//div[contains(@class,'action-high-low') and contains(@class,'button-put-wrap')]//a[contains(@class,'btn-put')]"
+# היכן כרום שרץ במצב remote-debugging
+# אם הבוט והכרום באותו מחשב: 127.0.0.1 ופורט 9222 זה טוב.
+# אם הבוט בריילווי ואתה חושף טאנל מהבית -> תגדיר פה IP/DNS ופורט של הטאנל.
+DEBUG_CHROME_HOST = os.getenv("DEBUG_CHROME_HOST", "127.0.0.1").strip()
+DEBUG_CHROME_PORT = int(os.getenv("DEBUG_CHROME_PORT", "9222").strip())
+
+# כמה זמן מינימום (שניות) בין עסקאות אוטומטיות רצופות
+DEFAULT_MIN_INTERVAL_SEC = int(os.getenv("AUTO_MIN_INTERVAL_SEC", "15").strip())
+
+# ספי ביטחון (יתעדכנו דינמית ע"י ה-LEARNER)
+DEFAULT_THRESHOLD_ENTER = int(os.getenv("AUTO_THRESHOLD_ENTER", "70").strip())
+DEFAULT_THRESHOLD_AGGR  = int(os.getenv("AUTO_THRESHOLD_AGGR", "80").strip())
+
+# XPaths של הכפתורים בפוקט אופשן
+# אלה הגיעו ממך. אם ה-HTML משתנה בפוקט, תעדכן פה.
+XPATH_UP = "//div[contains(@class,'action-high-low') and contains(@class,'button-call-wrap')]//a[contains(@class,'btn') and contains(@class,'btn-call')]"
+XPATH_DOWN = "//div[contains(@class,'action-high-low') and contains(@class,'button-put-wrap')]//a[contains(@class,'btn') and contains(@class,'btn-put')]"
+
+
+# =====================================================================================
+# מצב פנימי של המסחר האוטומטי
+# =====================================================================================
 
 @dataclass
 class AutoState:
-    enabled: bool = False
-    last_trade_ts: float = 0.0
-    last_side: Optional[Side] = None
-    last_error: Optional[str] = None
-    last_action: Optional[str] = None
+    enabled: bool = False                        # האם מסחר אוטומטי פעיל כרגע
+    threshold_enter: int = DEFAULT_THRESHOLD_ENTER  # מינימום ביטחון כדי בכלל לשקול כניסה
+    threshold_aggr: int = DEFAULT_THRESHOLD_AGGR   # סף "אגרסיבי" (בדרך כלל קצת יותר גבוה)
+    min_interval_sec: int = DEFAULT_MIN_INTERVAL_SEC
 
-    threshold_enter: int = 72        # כניסה רגילה
-    threshold_aggr: int  = 65        # כניסה אגרסיבית (רק אם strong_ok)
-    min_interval_sec: int = 15       # מניעת ספאם
-    anti_flip_sec: int   = 5         # לא להפוך כיוון מהר מדי
-
-    last_attempt_side: Optional[Side] = None
-    last_attempt_conf: Optional[int] = None
-    last_decision_reason: Optional[str] = None
+    last_action: Optional[str] = None            # "BUY↑" / "SELL↓" / "SKIP"
+    last_action_ts: float = 0.0                  # מתי ביצענו טרייד אחרון בפועל
+    last_error: Optional[str] = None             # לשמירת שגיאה פנימית אחרונה (debug)
 
 
 class AutoTrader:
     """
-    מטפל בלחיצה אוטומטית בפוקט אופשן אם כרום מחובר בדיבאג.
-    אם Selenium לא קיים -> DRY: רק מדווח מה היה עושה.
+    אחראי על:
+    - חיבור ל-Chrome פתוח שכבר מחובר ל-Pocket Option.
+    - לחיצה על הכפתור BUY או SELL.
+    - מניעת ספאם (מרווח זמן בין טריידים).
+    - כיבוד ספי ביטחון (confidence).
     """
 
     def __init__(self):
         self.state = AutoState()
-        self._driver = None
-        self._lock = threading.RLock()
-        if not SELENIUM_OK:
-            self.state.last_error = "Selenium not installed; auto-trading disabled"
+        self._driver: Optional[webdriver.Chrome] = None
+
+    # ------------------------------------------------------------------
+    # Public API שה-main.py משתמש בו
+    # ------------------------------------------------------------------
 
     def enable(self):
-        with self._lock:
-            if not SELENIUM_OK:
-                self.state.enabled = False
-                self.state.last_action = "failed enable (no selenium)"
-                self.state.last_error = "Install selenium to enable"
-            else:
-                self.state.enabled = True
-                self.state.last_action = "enabled"
+        self.state.enabled = True
 
     def disable(self):
-        with self._lock:
-            self.state.enabled = False
-            self.state.last_action = "disabled"
+        self.state.enabled = False
 
-    def set_threshold_enter(self, v: int):
-        with self._lock:
-            self.state.threshold_enter = max(55, min(int(v), 95))
+    def set_threshold_enter(self, val: int):
+        self.state.threshold_enter = max(1, min(99, int(val)))
 
-    def set_threshold_aggr(self, v: int):
-        with self._lock:
-            self.state.threshold_aggr = max(50, min(int(v), 90))
+    def set_threshold_aggr(self, val: int):
+        self.state.threshold_aggr = max(1, min(99, int(val)))
 
-    def set_min_interval(self, v: int):
-        with self._lock:
-            self.state.min_interval_sec = max(3, int(v))
+    def set_min_interval(self, seconds: int):
+        self.state.min_interval_sec = max(1, int(seconds))
 
-    def _ensure_driver(self):
-        if not SELENIUM_OK:
-            raise RuntimeError("Selenium unavailable")
-        if self._driver is not None:
-            return
-        opts = webdriver.ChromeOptions()  # type: ignore[attr-defined]
-        # מאוד חשוב: אתה חייב להריץ כרום מקומי עם:
-        # chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\ChromeDev"
-        opts.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"  # type: ignore[attr-defined]
-        self._driver = webdriver.Chrome(options=opts)  # type: ignore[call-arg]
+    def status_lines(self):
+        """
+        מחזיר שורות טקסט למצב האוטומציה (משמש בסטטוס בטלגרם).
+        """
+        lines = [
+            f"AutoTrading: {'ON' if self.state.enabled else 'OFF'}",
+            f"Threshold Enter: ≥{self.state.threshold_enter}",
+            f"Threshold Aggressive: ≥{self.state.threshold_aggr}",
+            f"Min Interval: {self.state.min_interval_sec}s",
+            f"Last Action: {self.state.last_action or 'None'}",
+            f"Last Action Age: {int(time.time() - self.state.last_action_ts)}s ago" if self.state.last_action_ts>0 else "Last Action Age: n/a",
+            f"Chrome Target: {DEBUG_CHROME_HOST}:{DEBUG_CHROME_PORT}",
+        ]
+        if self.state.last_error:
+            lines.append(f"Last Error: {self.state.last_error}")
+        return lines
 
-    def _click_xpath(self, xpath: str):
-        if not SELENIUM_OK:
-            raise RuntimeError("Selenium unavailable")
-        el = self._driver.find_element(By.XPATH, xpath)  # type: ignore[attr-defined]
-        el.click()
-
-    def can_trade_now(self, side: Side, conf: int, strong_ok: bool, now: float) -> (bool,str):
+    def place_if_allowed(self, side: str, conf: int, strong_ok: bool) -> bool:
+        """
+        מנסה לבצע טרייד אוטומטי לפי סיגנל.
+        החזרה היא True אם באמת בוצעה לחיצה BUY/SELL.
+        תנאים:
+        - האוטומציה דולקת
+        - הכיוון הוא "UP" או "DOWN"
+        - conf עומד בספים
+        - עבר מספיק זמן מהעסקה הקודמת
+        side: "UP" / "DOWN"
+        conf: ביטחון (אחוזים)
+        strong_ok: האם הבוט העריך שזה איתות איכותי (🟩 Strong + הסכמה בטיימפריימים)
+        """
         if not self.state.enabled:
-            return False, "auto OFF"
+            self._remember("SKIP", "Auto disabled")
+            return False
 
-        # אנטי ספאם
-        dt = now - self.state.last_trade_ts
-        if dt < self.state.min_interval_sec:
-            return False, f"cooldown {self.state.min_interval_sec-dt:.1f}s left"
+        # דרישת ביטחון:
+        # אם זה strong_ok, אפשר להסתפק ב-threshold_enter
+        # אחרת נבקש threshold_aggr
+        required = self.state.threshold_enter if strong_ok else self.state.threshold_aggr
+        if conf < required:
+            self._remember("SKIP", f"conf {conf} < required {required}")
+            return False
 
-        # אנטי היפוך
-        if self.state.last_side and self.state.last_side != side and dt < self.state.anti_flip_sec:
-            return False, "anti-flip guard"
+        # מניעת ספאם:
+        now = time.time()
+        if now - self.state.last_action_ts < self.state.min_interval_sec:
+            self._remember("SKIP", "cooldown/min_interval")
+            return False
 
-        # קבלת החלטה לפי thresholds
-        if conf >= self.state.threshold_enter:
-            return True, ">=enter threshold"
-        if conf >= self.state.threshold_aggr and strong_ok:
-            return True, ">=aggr+strong"
-        return False, "conf too low"
+        # בחר XPath
+        if side == "UP":
+            xpath = XPATH_UP
+            label = "BUY↑"
+        elif side == "DOWN":
+            xpath = XPATH_DOWN
+            label = "SELL↓"
+        else:
+            self._remember("SKIP", f"unsupported side {side}")
+            return False
 
-    def place_if_allowed(self, side: Side, conf: int, strong_ok: bool):
-        with self._lock:
-            now = time.time()
-            ok, reason = self.can_trade_now(side, conf, strong_ok, now)
+        ok = self._click_xpath(xpath)
+        if ok:
+            self._remember(label, None)
+        else:
+            self._remember("SKIP", "failed click")
 
-            self.state.last_attempt_side = side
-            self.state.last_attempt_conf = conf
-            self.state.last_decision_reason = reason
+        return ok
 
-            if not ok:
-                self.state.last_action = f"skipped ({reason})"
-                return False
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-            # מצב DRY אם אין Selenium
-            if not SELENIUM_OK:
-                self.state.last_error = "no selenium (dry)"
-                self.state.last_action = f"DRY would {side}"
-                self.state.last_trade_ts = now
-                self.state.last_side = side
-                return True
+    def _remember(self, action: str, err: Optional[str]):
+        self.state.last_action = action
+        self.state.last_action_ts = time.time()
+        self.state.last_error = err
 
-            # נסה באמת ללחוץ
+    def _connect_driver_if_needed(self) -> bool:
+        """
+        מחבר self._driver לכרום שרץ כבר עם remote-debugging-port.
+        אם כבר מחובר, יחזיר True.
+        אם לא מצליח להתחבר -> False.
+        """
+
+        # כבר יש חיבור פעיל? ננסה להשתמש בו
+        if self._driver is not None:
             try:
-                self._ensure_driver()
-                if side == "UP":
-                    self._click_xpath(XPATH_UP)
-                else:
-                    self._click_xpath(XPATH_DOWN)
-
-                self.state.last_trade_ts = now
-                self.state.last_side = side
-                self.state.last_error = None
-                self.state.last_action = f"clicked {side}"
+                # בדיקה קטנה שהדפדפן חי ולא נסגר
+                _ = self._driver.title
                 return True
+            except Exception:
+                # משהו נשבר / היסגר - ננסה להתחבר מחדש
+                try:
+                    self._driver.quit()
+                except Exception:
+                    pass
+                self._driver = None
 
-            except NoSuchElementException:
-                self.state.last_error = "xpath not found"
-                self.state.last_action = "error: xpath"
-                return False
-            except WebDriverException as e:  # type: ignore[name-defined]
-                self.state.last_error = f"webdriver error: {e}"
-                self.state.last_action = "error: webdriver"
-                return False
-            except Exception as e:
-                self.state.last_error = f"{type(e).__name__}: {e}"
-                self.state.last_action = "error"
+        # ניסיון להתחברות חדשה
+        try:
+            chrome_opts = Options()
+
+            # החלק הקריטי:
+            # זה אומר לסלניום "אל תפתח כרום חדש. תתחבר לכרום שכבר רץ פה"
+            chrome_opts.debugger_address = f"{DEBUG_CHROME_HOST}:{DEBUG_CHROME_PORT}"
+
+            # חשוב: כאן אנחנו מניחים שיש לך דרייבר כרום תואם במכונה הזאת
+            # (chromedriver תואם לגרסת הכרום שאתה מריץ).
+            self._driver = webdriver.Chrome(options=chrome_opts)
+            return True
+
+        except Exception as e:
+            self.state.last_error = f"connect fail: {e}"
+            # ננסה לנקות
+            try:
+                if self._driver:
+                    self._driver.quit()
+            except Exception:
+                pass
+            self._driver = None
+            return False
+
+    def _click_xpath(self, xpath: str) -> bool:
+        """
+        מנסה להתחבר לכרום ואז ללחוץ על האלמנט לפי ה-XPath.
+        """
+        try:
+            if not self._connect_driver_if_needed():
                 return False
 
-    def next_allowed_seconds(self) -> float:
-        with self._lock:
-            dt = time.time() - self.state.last_trade_ts
-            left = self.state.min_interval_sec - dt
-            return left if left>0 else 0.0
+            # חיפוש האלמנט
+            el = self._driver.find_element(By.XPATH, xpath)
 
-    def status_lines(self) -> list[str]:
-        with self._lock:
-            return [
-                f"AUTO: {'ON' if self.state.enabled else 'OFF'}",
-                f"Threshold enter: {self.state.threshold_enter}",
-                f"Threshold aggr: {self.state.threshold_aggr}",
-                f"Min interval: {self.state.min_interval_sec}s",
-                f"Anti-flip: {self.state.anti_flip_sec}s",
-                f"Next allowed in: {self.next_allowed_seconds():.1f}s",
-                f"Last action: {self.state.last_action or 'n/a'}",
-                f"Last try: side={self.state.last_attempt_side} conf={self.state.last_attempt_conf} reason={self.state.last_decision_reason}",
-                f"Selenium: {'OK' if SELENIUM_OK else 'NOT INSTALLED'}",
-                f"Chrome debug: {DEBUG_HOST}:{DEBUG_PORT}",
-                f"XPATH_UP: {XPATH_UP}",
-                f"XPATH_DOWN: {XPATH_DOWN}",
-                f"Last error: {self.state.last_error or 'none'}",
-            ]
+            # לחיצה
+            el.click()
+            return True
+
+        except Exception as e:
+            # נרשום שגיאה בשביל סטטוס
+            self.state.last_error = f"click fail: {e}"
+            traceback.print_exc()
+
+            # אם היתה בעיה גדולה (נגיד חלון נסגר), ננתק את הדרייבר
+            try:
+                if self._driver:
+                    # אל תעשה quit() מיידית בכל טעות קטנה, אבל
+                    # אם זה באמת בעיית חיבור/דפדפן מת -> אפשר לשקול כן.
+                    pass
+            except Exception:
+                pass
+
+            return False
