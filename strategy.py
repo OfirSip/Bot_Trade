@@ -22,6 +22,8 @@ CFG = {
 
 # ===== עזרי חישוב =====
 def _log_changes(prices: List[float]) -> List[float]:
+    if not prices:
+        return []
     base = prices[0]
     return [math.log(max(1e-12, p / base)) for p in prices]
 
@@ -65,6 +67,7 @@ def _direction_from_score(score: float, last_prices: List[float]) -> str:
     return "DOWN"
 
 def _persistence_ratio(step_series: List[float]) -> float:
+    """מחזיר את אחוז הצעדים החיוביים (0..1)."""
     if not step_series:
         return 0.5
     pos = sum(1 for d in step_series if d >= 0)
@@ -105,7 +108,7 @@ def compute_signal_from_prices(prices: List[float]) -> Tuple[str, int, Dict]:
     ema_fast  = _ema_alpha(ch, CFG["ALPHA_FAST"])
     ema_slow  = _ema_alpha(ch, CFG["ALPHA_SLOW"])
     ema_spread = ema_fast - ema_slow
-    trend_slope = ch[-1] - ch[0]
+    trend_slope = ch[-1] - ch[0] # שיפוע לוגריתמי
     rsi_v = _rsi(prices, CFG["RSI_PERIOD"])
 
     raw  = 0.58 * ema_spread + 0.42 * trend_slope
@@ -113,6 +116,35 @@ def compute_signal_from_prices(prices: List[float]) -> Tuple[str, int, Dict]:
 
     side_pre = _direction_from_score(raw, prices)
     side, norm_adj = _apply_hysteresis(side_pre, norm)
+
+    # ================================================================
+    # שדרוג: מנגנון סינון סיכונים (Regime / Counter-Trend)
+    # ----------------------------------------------------------------
+    # מטרתו להוריד את הביטחון (norm_adj) באגרסיביות
+    # אם תנאי השוק נראים מסוכנים (הלם, דשדוש, נגד מגמה).
+    # ================================================================
+    regime_penalty = 1.0
+    persist_log_steps = _persistence_ratio(df) # התמדה של צעדי הלוג (0..1)
+
+    # 1. זיהוי "SHOCK" (תנודתיות גבוהה מאוד, אבל ללא כיוון ברור)
+    if vol > 3e-3 and abs(trend_slope) < 1e-3:
+        regime_penalty *= 0.5 # עונש חריף על "הלם"
+        
+    # 2. זיהוי "RANGE" (שיפוע נמוך והתמדה נמוכה - "דשדוש")
+    if abs(trend_slope) < 6e-4 and persist_log_steps < 0.6:
+        regime_penalty *= 0.7 # עונש קל על "דשדוש"
+        
+    # 3. עונש על כניסה נגד מגמה (אם המגמה משמעותית)
+    if side == "UP" and trend_slope < -1e-4:
+        regime_penalty *= 0.65 # עונש בינוני
+    elif side == "DOWN" and trend_slope > 1e-4:
+        regime_penalty *= 0.65 # עונש בינוני
+
+    # החלת העונש הכולל
+    norm_adj *= regime_penalty
+    # ================================================================
+    # סוף שדרוג
+    # ================================================================
 
     # עונשים “רכים”
     if CFG["NEUTRAL_RSI_LOW"] <= rsi_v <= CFG["NEUTRAL_RSI_HIGH"]:
@@ -164,7 +196,8 @@ def compute_signal_from_prices(prices: List[float]) -> Tuple[str, int, Dict]:
             "vol": vol, "rsi": rsi_v, "ema_spread": ema_spread,
             "trend_slope": trend_slope, "norm": norm_adj,
             "persist": persist_price, "tick_imb": tick_imbalance,
-            "align_bonus": alignment_bonus
+            "align_bonus": alignment_bonus,
+            "penalty": regime_penalty # הוספנו לפלט
         }
 
     _LAST_SIGNAL_TS = now_ts
@@ -173,7 +206,8 @@ def compute_signal_from_prices(prices: List[float]) -> Tuple[str, int, Dict]:
         "price_now": prices[-1],
         "vol": vol, "rsi": rsi_v, "ema_spread": ema_spread, "trend_slope": trend_slope,
         "norm": norm_adj, "persist": persist_price, "tick_imb": tick_imbalance,
-        "align_bonus": alignment_bonus, "expiry": CFG["EXPIRY"]
+        "align_bonus": alignment_bonus, "expiry": CFG["EXPIRY"],
+        "penalty": regime_penalty # הוספנו לפלט
     }
     return side, conf, dbg
 
