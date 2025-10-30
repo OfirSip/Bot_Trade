@@ -2,6 +2,10 @@ from __future__ import annotations
 import os, json, time, base64, threading, requests
 from typing import Optional, Dict, Any, List
 
+###############################################################################
+# LEARNER משופר – ללא שינוי בלוגיקה החישובית המקורית, רק ייצוב ובלמים
+###############################################################################
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
 GITHUB_LEARNER_PATH = os.getenv("GITHUB_LEARNER_PATH", "learner_data.json").strip()
@@ -63,7 +67,7 @@ def github_save_file(payload: Dict[str, Any]) -> bool:
 
 
 # ============================================================
-# Learner state
+# Learner
 # ============================================================
 
 class LearnerState:
@@ -74,6 +78,7 @@ class LearnerState:
         self.threshold_aggr = 80
         self.counter = 0
 
+    # ---------- Persistence ----------
     def load_from_github(self):
         data = github_load_file()
         if not data:
@@ -93,6 +98,7 @@ class LearnerState:
             }
         github_save_file(payload)
 
+    # ---------- Data ----------
     def new_sample(self, asset: str, side: str, conf: int, quality: str, agree3: bool,
                    rsi: float, ema_spread: float, persist: float, tick_imb: float, align_bonus: float) -> int:
         s = {
@@ -119,6 +125,7 @@ class LearnerState:
                 self.samples[idx]["result"] = bool(success)
         self.save_to_github()
 
+    # ---------- Statistics ----------
     def _collect_stats(self):
         with self.lock:
             data = list(self.samples)
@@ -145,8 +152,8 @@ class LearnerState:
             "agree_wr": pct(agree3["hit"], agree3["tot"])
         }
 
+    # ---------- Dynamic thresholds ----------
     def dynamic_thresholds(self, base_enter: int, base_aggr: int):
-        """עדכון ספים הדרגתי ויציב"""
         stats = self._collect_stats()
         self.counter += 1
         if self.counter % 10 != 0:
